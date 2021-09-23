@@ -192,7 +192,7 @@ fn make_stream<'a>(
     statement: &'a hyper::Uri,
     count: usize,
 ) -> impl futures::Stream + 'a {
-    let concurrency_limit = 512;
+    let concurrency_limit = 5000;
 
     futures::stream::iter(0..count)
         .map(move |_| async move {
