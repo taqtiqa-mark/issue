@@ -36,7 +36,6 @@ pub trait HttpClient: Send + Sync + Clone + 'static {
 #[derive(Clone)]
 pub struct Client {
     pub client: HyperClient<HttpConnector>,
-    //pub client_tls: HyperClient<HttpsConnector<HttpConnector>>,
 }
 
 impl Client {
@@ -46,18 +45,6 @@ impl Client {
             client: http_client(),
         }
     }
-
-    // fn get_url(&self) -> hyper::Uri {
-    //     // HTTPS requires picking a TLS implementation, so give a better
-    //     // warning if the user tries to request an 'https' URL.
-    //     //let url =
-    //     URI.to_owned().parse::<hyper::Uri>().unwrap()
-    //     // if url.scheme_str() != Some("http") {
-    //     //     println!("This example only works with 'http' URLs.");
-    //     //     return "http://127.0.0.1".parse::<hyper::Uri>().unwrap();
-    //     // }
-    //     //url
-    // }
 }
 
 fn http_client() -> HyperClient<hyper::client::HttpConnector> {
@@ -199,7 +186,6 @@ fn connection_error(e: &io::Error) -> bool {
 /// Invokes client get URL, return a stream of response durations.
 /// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
 /// Async code runs on the caller thread.
-///    -> impl Stream<Item=Duration> + 'a {
 #[instrument]
 fn make_stream<'a>(
     session: &'a hyper::Client<hyper::client::HttpConnector>,
