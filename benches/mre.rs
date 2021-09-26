@@ -2,14 +2,15 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
-use tracing::{self, debug, warn, info};
-use tracing::instrument;
+use async_trait::async_trait;
+use deadpool::managed;
 use futures::StreamExt;
 use lazy_static::lazy_static;
-use async_trait::async_trait;
+use tracing::instrument;
+use tracing::{self, debug, info, warn};
 
 lazy_static! {
-    static ref URL: hyper::Uri = hyper::Uri::from_static("http://127.0.0.1:8888");
+    static ref URL: surf::Url = surf::Url::parse("http://127.0.0.1:8888").expect("URL");
 }
 
 // const URI: &str = "https://127.0.0.1";
@@ -50,6 +51,57 @@ impl Client {
 fn http_client() -> HyperClient<hyper::client::HttpConnector> {
     HyperClient::new()
 }
+
+/// Deadpool managed connection pool for HTTP client.
+// #[derive(Debug)]
+// enum Error {
+//     Fail,
+// }
+
+// pub struct PoolClient {
+//     conn: hyper::Client<hyper::client::HttpConnector>,
+// }
+
+// impl PoolClient {
+//     async fn get_url(&self) {
+//         // let req = Request::new(Method::Get, "http://example.org");
+//         // self.conn.send(req).await.unwrap()
+//     }
+// }
+
+// struct Manager {}
+
+// #[async_trait]
+// impl managed::Manager for Manager {
+//     type Type = PoolClient;
+//     type Error = Error;
+
+//     // async fn create(&self) -> Result<PoolClient, Error> {
+//     //     // let conf = http_client::Config::new();
+//     //     // conf.set_http_keep_alive(true);
+//     //     // conf.set_tcp_no_delay(true);
+//     //     // conf.set_timeout(std::time::Duration::from_secs(5));
+//     //     // conf.set_tcp_no_delay(true);
+//     //     // conf.set_max_connections_per_host(1000);
+//     //     // let conn = http_client::h1::H1Client::new();
+//     //     // Ok(PoolClient { conn: conn.set_config(conf) })
+//     // }
+
+//     async fn recycle(&self, _: &mut PoolClient) -> managed::RecycleResult<Error> {
+//         Ok(())
+//     }
+// }
+
+// type Pool = managed::Pool<Manager>;
+
+// #[tokio::main]
+// async fn main() {
+//     let mgr = Manager {};
+//     let pool = Pool::builder(mgr).build().unwrap();
+//     let mut conn = pool.get().await.unwrap();
+//     let resp = conn.get_url().await;
+//     assert_eq!(resp, 42);
+// }
 
 /// This is the main function, evolved from this gist:
 /// https://gist.github.com/klausi/f94b9aff7d36a1cb4ebbca746f0a099f
@@ -93,8 +145,8 @@ async fn init_real_server() {
                 }
                 Err(e) if connection_error(e) => {
                     debug!("Connection error: {}", e);
-                    continue
-                },
+                    continue;
+                }
                 // Ignore socket errors like "Too many open files" on the OS
                 // level. We need to sleep for a bit because the socket is not
                 // removed from the accept queue in this case. A direct continue
@@ -192,22 +244,22 @@ fn connection_error(e: &io::Error) -> bool {
 /// Async code runs on the caller thread.
 #[instrument]
 fn make_stream<'a>(
-    session: &'a hyper::Client<hyper::client::HttpConnector>,
-    statement: &'a hyper::Uri,
+    session: &'a surf::Client,
+    statement: &'a URL,
     count: usize,
 ) -> impl futures::Stream + 'a {
-    let concurrency_limit = 5000;
+    let concurrency_limit = 100;
 
     futures::stream::iter(0..count)
         .map(move |_| async move {
-            let statement = statement.clone();
+            //let statement = statement;
             debug!("Concurrently iterating client code as future");
             let query_start = tokio::time::Instant::now();
-            let response = session.get(statement).await;
-            let (parts, body)  = response.unwrap().into_parts();
+            let mut response = session.get("/").await.expect("Surf response");
+            //let (parts, body) = response.unwrap().into_parts();
             // Concatenate the body stream into a single buffer...
-            let body = hyper::body::to_bytes(body).await;
-            debug!("PARTS:\n{:?}\nBODY:\n{:?}", parts, body);
+            let body = response.body_string().await.expect("Surf body");
+            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
             query_start.elapsed()
         })
         // This will run up to `concurrency_limit` futures at a time:
@@ -223,11 +275,7 @@ impl std::fmt::Debug for URL {
 }
 
 #[instrument]
-async fn run_stream_ct(
-    session: hyper::Client<hyper::client::HttpConnector>,
-    statement: &'static URL,
-    count: usize,
-) {
+async fn run_stream_ct(session: surf::Client, statement: &'static URL, count: usize) {
     // Construct a local task set that can run `!Send` futures.
     let local = tokio::task::LocalSet::new();
     // Run the local task set.
@@ -254,12 +302,28 @@ async fn capacity(count: usize) {
     debug!("About to init server");
     init_real_server().await;
     debug!("About to init client");
-    // This client build halves through put, compared to client new.
-    let session = hyper::Client::builder()
-    .pool_max_idle_per_host(0)
-    .pool_idle_timeout(std::time::Duration::from_secs(5))
-    .build_http::<hyper::Body>();
-    // let session = Client::new().client;
+    // hyper::Client::builder() halves throughput, compared to hyper::Client::new().
+    // let session = hyper::Client::builder()
+    //     .pool_max_idle_per_host(0)
+    //     .pool_idle_timeout(std::time::Duration::from_secs(5))
+    //     .build_http::<hyper::Body>();
+    // // let session = Client::new().client;
+    // let conf = http_client::Config::new();
+    // // connection pooling
+    // conf.set_http_keep_alive(true);
+    // conf.set_tcp_no_delay(true);
+    // conf.set_timeout(Some(std::time::Duration::from_secs(5)));
+    // conf.set_tcp_no_delay(true);
+    // conf.set_max_connections_per_host(1000);
+    use std::convert::TryInto;
+    let session: surf::Client = surf::Config::new()
+        .set_base_url(URL.clone())
+        .set_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_tcp_no_delay(true)
+        .set_http_keep_alive(true)
+        .try_into()
+        .unwrap();
+    // session.set_config(conf);
     let statement = &URL;
     let benchmark_start = tokio::time::Instant::now();
     debug!("Client: About to spawn blocking (Tokio)");

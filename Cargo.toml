@@ -6,11 +6,15 @@ edition = "2018"
 [dependencies]
 async-stream = "0.3"
 async-trait = "0.1"
+deadpool = { version = "0.8.2", features = ["managed", "rt_tokio_1"]}
 futures = "0.3.15"
 futures-util = "0.3.17"
+# http-client = {version = "6.5.1", features = ["h1_client"]}
+http-types = "2.12.0"
 hyper = { version = "0.14", features = ["full", "runtime"] }
 lazy_static = "1.4.0"
 num_cpus = "1.13.0"
+surf = {version = "2.3.1", features = ["h1-client-rustls"] }
 tokio = { version = "^1.8", features = [
     "fs",
     "io-std",
