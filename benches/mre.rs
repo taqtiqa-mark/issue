@@ -91,13 +91,17 @@ async fn init_real_server() {
                         };
                     }
                 }
-                Err(e) if connection_error(e) => continue,
+                Err(e) if connection_error(e) => {
+                    debug!("Connection error: {}", e);
+                    continue
+                },
                 // Ignore socket errors like "Too many open files" on the OS
                 // level. We need to sleep for a bit because the socket is not
                 // removed from the accept queue in this case. A direct continue
                 // would spin the CPU really hard with the same error again and
                 // again.
-                Err(_) => {
+                Err(e2) => {
+                    debug!("Catchall error e.g. Too many open files: {}", e2);
                     let ten_millis = time::Duration::from_millis(10);
                     std::thread::sleep(ten_millis);
                     continue;
@@ -199,8 +203,11 @@ fn make_stream<'a>(
             let statement = statement.clone();
             debug!("Concurrently iterating client code as future");
             let query_start = tokio::time::Instant::now();
-            let _response = session.get(statement).await;
-            // let (_parts, _body)  = response.unwrap().into_parts();
+            let response = session.get(statement).await;
+            let (parts, body)  = response.unwrap().into_parts();
+            // Concatenate the body stream into a single buffer...
+            let body = hyper::body::to_bytes(body).await;
+            debug!("PARTS:\n{:?}\nBODY:\n{:?}", parts, body);
             query_start.elapsed()
         })
         // This will run up to `concurrency_limit` futures at a time:
@@ -228,15 +235,15 @@ async fn run_stream_ct(
         .run_until(async move {
             let _task = tokio::task::spawn_local(async move {
                 let session = &session;
-                let statement = &statement;
+                let statement = statement;
                 debug!("About to make stream");
-                let mut stream = make_stream(&session, statement, count);
+                let mut stream = make_stream(session, statement, count);
                 while let Some(_duration) = stream.next().await {
                     debug!("Stream next polled.");
                 }
             })
-            .await
-            .unwrap();
+            .await;
+            //.unwrap();
         })
         .await;
     //task.await;
@@ -247,6 +254,10 @@ async fn capacity(count: usize) {
     debug!("About to init server");
     init_real_server().await;
     debug!("About to init client");
+    let client = hyper::Client::builder()
+    .pool_idle_timeout(std::time::Duration::from_secs(15))
+    .http2_only(true);
+    //.build();
     let session = Client::new().client;
     let statement = &URL;
     let benchmark_start = tokio::time::Instant::now();
@@ -277,7 +288,7 @@ async fn capacity(count: usize) {
 
 fn calibrate_limit(c: &mut Criterion) {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::TRACE)
         .try_init()
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
