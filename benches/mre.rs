@@ -2,7 +2,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
-use tracing::{self, debug, warn, };
+use tracing::{self, debug, warn, info};
 use tracing::instrument;
 use futures::StreamExt;
 use lazy_static::lazy_static;
@@ -101,7 +101,7 @@ async fn init_real_server() {
                 // would spin the CPU really hard with the same error again and
                 // again.
                 Err(e2) => {
-                    debug!("Catchall error e.g. Too many open files: {}", e2);
+                    println!("Catchall error e.g. Too many open files: {}", e2);
                     let ten_millis = time::Duration::from_millis(10);
                     std::thread::sleep(ten_millis);
                     continue;
@@ -254,11 +254,12 @@ async fn capacity(count: usize) {
     debug!("About to init server");
     init_real_server().await;
     debug!("About to init client");
-    let client = hyper::Client::builder()
-    .pool_idle_timeout(std::time::Duration::from_secs(15))
-    .http2_only(true);
-    //.build();
-    let session = Client::new().client;
+    // This client build halves through put, compared to client new.
+    let session = hyper::Client::builder()
+    .pool_max_idle_per_host(0)
+    .pool_idle_timeout(std::time::Duration::from_secs(5))
+    .build_http::<hyper::Body>();
+    // let session = Client::new().client;
     let statement = &URL;
     let benchmark_start = tokio::time::Instant::now();
     debug!("Client: About to spawn blocking (Tokio)");
@@ -288,7 +289,7 @@ async fn capacity(count: usize) {
 
 fn calibrate_limit(c: &mut Criterion) {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::INFO)
         .try_init()
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
