@@ -109,7 +109,7 @@ fn http_client() -> HyperClient<hyper::client::HttpConnector> {
 async fn init_real_server() {
     let addr: SocketAddr = ([127, 0, 0, 1], 8888).into();
     let mut channels = Vec::new();
-    let num_threads = num_cpus::get();
+    let num_threads = num_cpus::get() * 2;
     for _i in 0..num_threads {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         channels.push(tx);
@@ -198,6 +198,19 @@ async fn worker(mut rx: tokio::sync::mpsc::UnboundedReceiver<tokio::net::TcpStre
     debug!("The worker has stopped!");
 }
 
+async fn srv_worker(mut rx: tokio::sync::mpsc::UnboundedReceiver<tokio::net::TcpStream>) {
+    debug!("Entering worker function.");
+    while let Some(socket) = rx.recv().await {
+        debug!("Channel receiver polled.");
+        // A new task is spawned for each inbound socket. The socket is
+        // moved to the new task and processed there.
+        tokio::spawn(async move {
+            process(socket).await;
+        });
+    }
+    debug!("The worker has stopped!");
+}
+
 async fn process(socket: TcpStream) {
     debug!(
         "Serving to {:?} using thread {:?}",
@@ -208,6 +221,107 @@ async fn process(socket: TcpStream) {
     let mut http = hyper::server::conn::Http::new();
     http.http1_only(true);
     let serve = http.serve_connection(socket, hyper::service::service_fn(hello));
+    if let Err(e) = serve.await {
+        debug!("server connection error: {}", e);
+    }
+}
+
+/// This is the main function, evolved from this gist:
+/// https://gist.github.com/klausi/f94b9aff7d36a1cb4ebbca746f0a099f
+#[instrument]
+async fn serve() {
+    debug!("Exiting serve()");
+
+    // let mut channels = Vec::new();
+    // let num_threads = num_cpus::get()*2;
+    // for _i in 0..num_threads {
+    //     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    //     channels.push(tx);
+    //     tokio::spawn(async move {
+    //         worker(rx).await;
+    //     });
+    // }
+    let addr: SocketAddr = ([127, 0, 0, 1], 8888).into();
+    //let listener = reuse_listener(&addr).await.expect("couldn't bind to addr");
+    // let mut next = 0;
+    // let accepting = async move {
+    //let handle = tokio::spawn(async move {
+    let mut http = hyper::server::conn::Http::new();
+    http.http1_only(true);
+    debug!("Created HTTP connection");
+    //loop {
+    //let local = tokio::task::LocalSet::new();
+    //local.spawn_local(async move {
+    let listener = reuse_listener(&addr).await.expect("couldn't bind to addr");
+    println!("Listening on address: {}", addr);
+    while let (socket, h ) = (listener.accept().await, http.clone()) {
+        debug!("Listener accepted connection.");
+        match socket.as_ref() {
+            Ok((stream, _)) => {
+                debug!("Stream processing...");
+                stream
+                    .set_nodelay(true)
+                    .expect("Set no delay on TCP stream.");
+                stream.readable().await.expect("A readable TCP stream.");
+                let (stream, _) = socket.unwrap();
+                srv_process(stream, h).await;
+                //continue;
+                //debug!("Sending to channel #: {}", next);
+                // Skip when socket closed
+                // if !channels[next].is_closed() {
+                //     let _v = match channels[next].send(stream) {
+                //         Ok(_v) => {
+                //             next = (next + 1) % channels.len();
+                //         }
+                //         Err(e) => return warn!("Send failed ({})", e),
+                //     };
+                // }
+            }
+            Err(e) if connection_error(e) => {
+                debug!("Connection error: {}", e);
+                //break;
+            }
+            // Ignore socket errors like "Too many open files" on the OS
+            // level. We need to sleep for a bit because the socket is not
+            // removed from the accept queue in this case. A direct continue
+            // would spin the CPU really hard with the same error again and
+            // again.
+            Err(e2) => {
+                println!("Catchall error e.g. Too many open files: {}", e2);
+                let ten_millis = time::Duration::from_millis(10);
+                std::thread::sleep(ten_millis);
+                //break;
+            }
+        }
+    }
+    //local.await;
+    //rt.block_on(local);
+    //slh.await.expect("Accept connection.")
+    //()
+    //});
+    //debug!("Spawning accept connection future");
+    //accepting.await.expect("Accepting connections.");
+    // let handle = tokio::spawn(
+    //     async { accepting.await.expect("Accepting connections.") }
+    // );
+    //let handle = tokio::task::spawn_blocking(move || async { accepting.await } );
+    //debug!("Polling accept connection future");
+    //let srv = handle.join().expect("Server");
+    //srv.await;
+    //handle.await.expect("Server");
+    debug!("Exiting serve()");
+}
+
+async fn srv_process(stream: TcpStream, http: hyper::server::conn::Http) {
+    debug!(
+        "Serving to {:?} using thread {:?}",
+        stream.peer_addr(),
+        std::thread::current().id()
+    );
+
+    // let mut http = hyper::server::conn::Http::new();
+    // http.http1_only(true);
+    let serve = http.serve_connection(stream, hyper::service::service_fn(hello));
     if let Err(e) = serve.await {
         debug!("server connection error: {}", e);
     }
@@ -243,12 +357,41 @@ fn connection_error(e: &io::Error) -> bool {
 /// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
 /// Async code runs on the caller thread.
 #[instrument]
-fn make_stream<'a>(
-    session: &'a surf::Client,
-    statement: &'a URL,
+fn make_srv_stream<'a>(
+    //socket: TcpStream,
+    // statement: &'a URL,
+    //servers: &'a mut std::vec::Vec<std::thread::JoinHandle<()>>,
     count: usize,
 ) -> impl futures::Stream + 'a {
-    let concurrency_limit = 100;
+    let concurrency_limit = count;
+
+    futures::stream::iter(0..count)
+        .map(move |_| async move {
+            //let statement = statement;
+            debug!("Concurrently generating server threads as future stream (concurrent iterator)");
+            //let query_start = tokio::time::Instant::now();
+            //servers.push(serve().await)
+            serve().await
+            //let (parts, body) = response.unwrap().into_parts();
+            // Concatenate the body stream into a single buffer...
+            //let body = response.body_string().await.expect("Surf body");
+            //debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
+            //query_start.elapsed()
+        })
+        // This will run up to `concurrency_limit` futures at a time:
+        .buffer_unordered(concurrency_limit)
+}
+
+/// Invokes client get URL, return a stream of response durations.
+/// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
+/// Async code runs on the caller thread.
+#[instrument]
+fn make_stream<'a>(
+    session: &'a surf::Client,
+    // statement: &'a URL,
+    count: usize,
+) -> impl futures::Stream + 'a {
+    let concurrency_limit = 500;
 
     futures::stream::iter(0..count)
         .map(move |_| async move {
@@ -274,33 +417,86 @@ impl std::fmt::Debug for URL {
     }
 }
 
+async fn run_srv_stream(count: usize) {
+    //let mut servers = std::vec::Vec::new();
+    let task = tokio::spawn(async move {
+        let mut stream = make_srv_stream(count);
+        while let Some(handle) = stream.next().await {
+            debug!("Next server stream polled.");
+        }
+        // let s = async_stream::stream! {
+        //     while let Some(handle) = stream.next().await {
+        //         yield servers.push(handle)
+        //     }
+        // };
+    });
+}
+
+//  statement: &'static URL,
 #[instrument]
-async fn run_stream_ct(session: surf::Client, statement: &'static URL, count: usize) {
+async fn run_stream_ct(session: std::sync::Arc<surf::Client>, count: usize) {
+    let handle = tokio::task::spawn(async move {
+        use std::convert::TryInto;
+        let session2: surf::Client = surf::Config::new()
+            .set_http_client(http_client::h1::H1Client::new())
+            .set_base_url(URL.clone())
+            //.set_timeout(Some(std::time::Duration::from_secs(180)))
+            .set_tcp_no_delay(true)
+            .set_http_keep_alive(true)
+            .set_max_connections_per_host(10)
+            .try_into()
+            .unwrap();
+        // let rt = tokio::runtime::Builder::new_current_thread()
+        //     .enable_all()
+        //     .build()
+        //     .unwrap();
+        // //let local = tokio::task::LocalSet::new();
+        //local.spawn_local(async move {
+        let session = &session2;
+        debug!("About to make stream");
+        let mut stream = make_stream(session, count);
+        while let Some(_duration) = stream.next().await {
+            debug!("Stream next polled.");
+        }
+        // If the while loop returns, then all the LocalSpawner
+        // objects have have been dropped.
+        //});
+        // This will return once all senders are dropped and all
+        // spawned tasks have returned.
+        //rt.block_on(local);
+    });
+    //jh
     // Construct a local task set that can run `!Send` futures.
-    let local = tokio::task::LocalSet::new();
+    //let local = tokio::task::LocalSet::new();
     // Run the local task set.
-    local
-        .run_until(async move {
-            let _task = tokio::task::spawn_local(async move {
-                let session = &session;
-                let statement = statement;
-                debug!("About to make stream");
-                let mut stream = make_stream(session, statement, count);
-                while let Some(_duration) = stream.next().await {
-                    debug!("Stream next polled.");
-                }
-            })
-            .await;
-            //.unwrap();
-        })
-        .await;
-    //task.await;
+    //local
+    //    .run_until(async move {
+    // let task = tokio::task::spawn(async move {
+    //     let session = session.as_ref();
+    //     // let statement = statement;
+    //     debug!("About to make stream");
+    //     let mut stream = make_stream(session, count);
+    //     while let Some(_duration) = stream.next().await {
+    //         debug!("Stream next polled.");
+    //     }
+    // });
+    //.await;
+    //.unwrap();
+    //})
+    //.await;
+    handle.await.expect("Client task");
 }
 
 #[instrument]
 async fn capacity(count: usize) {
-    debug!("About to init server");
-    init_real_server().await;
+    // debug!("About to init server1");
+    // init_real_server().await;
+    // debug!("About to init server2");
+    // init_real_server().await;
+    // debug!("About to init server3");
+    // init_real_server().await;
+    // debug!("About to init server4");
+    // init_real_server().await;
     debug!("About to init client");
     // hyper::Client::builder() halves throughput, compared to hyper::Client::new().
     // let session = hyper::Client::builder()
@@ -317,34 +513,46 @@ async fn capacity(count: usize) {
     // conf.set_max_connections_per_host(1000);
     use std::convert::TryInto;
     let session: surf::Client = surf::Config::new()
+        .set_http_client(http_client::h1::H1Client::new())
         .set_base_url(URL.clone())
         .set_timeout(Some(std::time::Duration::from_secs(5)))
         .set_tcp_no_delay(true)
         .set_http_keep_alive(true)
+        .set_max_connections_per_host(500)
         .try_into()
         .unwrap();
+    let session = std::sync::Arc::new(session);
+    //session::with_http_client(http_client::h1::H1Client::new());
+    // let session = surf::Client::with_http_client(http_client::h1::h1Client::new());
     // session.set_config(conf);
-    let statement = &URL;
+    // let statement = &URL;
     let benchmark_start = tokio::time::Instant::now();
-    debug!("Client: About to spawn blocking (Tokio)");
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        debug!("Client: About to block on (Tokio)");
-        rt.block_on(async {
-            let local = tokio::task::LocalSet::new();
-            debug!("Client: About to run until (local set)");
-            local
-                .run_until(async move {
-                    debug!("Client: About to spawn local (Tokio)");
-                    tokio::task::spawn_local(run_stream_ct(session.clone(), statement, count / 2))
-                        .await
-                        .expect("Tokio spawn local (streams for clients)");
-                })
-                .await;
-        });
-    })
-    .await
-    .unwrap();
+    // debug!("Client: About to spawn blocking (Tokio)");
+    // tokio::task::spawn_blocking(move || {
+    //     let rt = tokio::runtime::Handle::current();
+    //     debug!("Client: About to block on (Tokio)");
+    //     rt.block_on(async {
+    //         let local = tokio::task::LocalSet::new();
+    //         debug!("Client: About to run until (local set)");
+    //         local
+    //             .run_until(async move {
+    //                 debug!("Client: About to spawn local (Tokio)");
+    //                 tokio::task::spawn_local(run_stream_ct(session.clone(), count / 2))
+    //                     .await
+    //                     .expect("Tokio spawn local (streams for clients)");
+    //             })
+    //             .await;
+    //     });
+    // })
+    let srv_thread1 = run_srv_stream(50);
+    let thread1 = run_stream_ct(session.clone(), count);
+    // let thread2 = run_stream_ct(session.clone(), count / 2);
+    srv_thread1.await;
+    thread1.await; //.expect("Thread1 panicked");
+                   // thread2.await.join().expect("Thread2 panicked");
+                   // thread1.join().expect("Thread1 panicked");
+                   // thread2.join().expect("Thread2 panicked");
+                   // .unwrap();
     println!(
         "Throughput: {:.1} request/s",
         1000000.0 * count as f64 / benchmark_start.elapsed().as_micros() as f64
@@ -359,7 +567,14 @@ fn calibrate_limit(c: &mut Criterion) {
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
     let count = 100000;
-    let tokio_executor = tokio::runtime::Runtime::new().expect("initializing tokio runtime");
+    // let tokio_executor = tokio::runtime::Runtime::new().expect("initializing tokio runtime");
+    let tokio_executor = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(8)
+        .thread_name("calibrate-limit")
+        .thread_stack_size(4 * 1024 * 1024)
+        .build()
+        .unwrap();
     group.bench_with_input(
         BenchmarkId::new("calibrate-limit", count),
         &count,
