@@ -6,6 +6,138 @@ use std::time;
 use tracing::{self, debug};
 use tracing::instrument;
 
+/// Setup Streams for HTTP GET
+///
+/// Invoke client to get URL, return a stream of response durations.
+/// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
+/// Async code runs on the caller thread.
+///
+/// For a detailed description of this setup, see:
+/// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
+#[instrument]
+fn make_stream<'a>(
+    session: &'a surf::Client,
+    count: usize,
+) -> impl futures::Stream + 'a {
+
+    let concurrency_limit = 5000;
+
+    futures::stream::iter(0..count)
+        .map(move |_| async move {
+            debug!("Concurrently iterating client code as future");
+            let query_start = tokio::time::Instant::now();
+            // This is for Hyper client use case
+            // let mut response = session.get("/").await.expect("Hyper response");
+            // let (parts, body) = response.unwrap().into_parts();
+            //
+            // This is for Surf client use case
+            let mut response = session.get("/").await.expect("Surf response");
+            let body = response.body_string().await.expect("Surf body");
+            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
+            query_start.elapsed()
+        })
+        .buffer_unordered(concurrency_limit)
+}
+
+//  statement: &'static URL,
+#[instrument]
+async fn run_stream(session: surf::Client, count: usize) {
+    let handle = tokio::task::spawn(async move {
+        let session = &session;
+        debug!("About to make stream");
+        let mut stream = make_stream(session, count);
+        while let Some(_duration) = stream.next().await {
+            debug!("Stream next polled.");
+        }
+    });
+    handle.await.expect("Client task");
+}
+
+#[instrument]
+async fn capacity(count: usize) {
+    let mut server = Some(spawn_server());
+    if let Some(ref server) = server {
+        // Any String will start the server...
+        server.send(Msg::Echo("Start".to_string())).unwrap();
+        let secs = time::Duration::from_millis(2000);
+        std::thread::sleep(secs);
+        println!("The server WAS spawned!");
+    } else {
+        println!("The server was NOT spawned!");
+    };
+    debug!("About to init client");
+    //let session = hyper::Client::new();
+    use std::convert::TryInto;
+    let session: surf::Client = surf::Config::new()
+        .set_http_client(http_client::h1::H1Client::new())
+        .set_base_url(surf::Url::parse("http://127.0.0.1:8888").unwrap())
+        .set_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_tcp_no_delay(true)
+        .set_http_keep_alive(true)
+        .set_max_connections_per_host(50)
+        .try_into()
+        .unwrap();
+    let benchmark_start = tokio::time::Instant::now();
+    let ftr = run_stream(session.clone(), count);
+    ftr.await;
+    // Stop the server thread using the channel pattern...
+    // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
+    drop(server.take().expect("MIO server stopped"));
+    println!(
+        "Throughput: {:.1} request/s",
+        1000000.0 * count as f64 / benchmark_start.elapsed().as_micros() as f64
+    );
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Criterion setup
+//
+// The hang behaviour is intermittent.
+// We use Criterion to run 100 iterations which should be sufficient to
+// generate at least one hang across different users/machines.
+//
+fn calibrate_limit(c: &mut Criterion) {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init()
+        .expect("Tracing subscriber in benchmark");
+    debug!("Running on thread {:?}", std::thread::current().id());
+    let mut group = c.benchmark_group("Calibrate");
+    let count = 100000;
+    let tokio_executor = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(8)
+        .thread_name("calibrate-limit")
+        .thread_stack_size(4 * 1024 * 1024)
+        .build()
+        .unwrap();
+    group.bench_with_input(
+        BenchmarkId::new("calibrate-limit", count),
+        &count,
+        |b, &_s| {
+            // Insert a call to `to_async` to convert the bencher to async mode.
+            // The timing loops are the same as with the normal bencher.
+            b.to_async(&tokio_executor).iter(|| capacity(count));
+        },
+    );
+
+    group.finish();
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().with_profiler(PProfProfiler::new(3, Output::Protobuf));
+    targets = calibrate_limit
+}
+
+criterion_main!(benches);
+
+////////////////////////////////////////////////////////////////////////////////
+// Server setup
+//
+// This rules out anything Hyper server related.
+// This also means the example is self contained, hence reproducible
+//
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
 Connection: keep-alive
@@ -162,117 +294,3 @@ fn reuse_mio_listener(
     builder.bind(*addr).expect("TCP socket");
     Ok(builder.listen(1024).expect("TCP listener"))
 }
-
-/// Invokes client get URL, return a stream of response durations.
-/// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
-/// Async code runs on the caller thread.
-#[instrument]
-fn make_stream<'a>(
-    session: &'a surf::Client,
-    count: usize,
-) -> impl futures::Stream + 'a {
-
-    let concurrency_limit = 5000;
-
-    futures::stream::iter(0..count)
-        .map(move |_| async move {
-            debug!("Concurrently iterating client code as future");
-            let query_start = tokio::time::Instant::now();
-            // This is for Hyper client use case
-            // let mut response = session.get("/").await.expect("Hyper response");
-            // let (parts, body) = response.unwrap().into_parts();
-            //
-            // This is for Surf client use case
-            let mut response = session.get("/").await.expect("Surf response");
-            let body = response.body_string().await.expect("Surf body");
-            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
-            query_start.elapsed()
-        })
-        .buffer_unordered(concurrency_limit)
-}
-
-//  statement: &'static URL,
-#[instrument]
-async fn run_stream(session: surf::Client, count: usize) {
-    let handle = tokio::task::spawn(async move {
-        let session = &session;
-        debug!("About to make stream");
-        let mut stream = make_stream(session, count);
-        while let Some(_duration) = stream.next().await {
-            debug!("Stream next polled.");
-        }
-    });
-    handle.await.expect("Client task");
-}
-
-#[instrument]
-async fn capacity(count: usize) {
-    let mut server = Some(spawn_server());
-    if let Some(ref server) = server {
-        // Any String will start the server...
-        server.send(Msg::Echo("Start".to_string())).unwrap();
-        let secs = time::Duration::from_millis(2000);
-        std::thread::sleep(secs);
-        println!("The server WAS spawned!");
-    } else {
-        println!("The server was NOT spawned!");
-    };
-    debug!("About to init client");
-    //let session = hyper::Client::new();
-    use std::convert::TryInto;
-    let session: surf::Client = surf::Config::new()
-        .set_http_client(http_client::h1::H1Client::new())
-        .set_base_url(surf::Url::parse("http://127.0.0.1:8888").unwrap())
-        .set_timeout(Some(std::time::Duration::from_secs(5)))
-        .set_tcp_no_delay(true)
-        .set_http_keep_alive(true)
-        .set_max_connections_per_host(50)
-        .try_into()
-        .unwrap();
-    let benchmark_start = tokio::time::Instant::now();
-    let ftr = run_stream(session.clone(), count);
-    ftr.await;
-    // Stop the server thread using the channel pattern...
-    // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
-    drop(server.take().expect("MIO server stopped"));
-    println!(
-        "Throughput: {:.1} request/s",
-        1000000.0 * count as f64 / benchmark_start.elapsed().as_micros() as f64
-    );
-}
-
-fn calibrate_limit(c: &mut Criterion) {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init()
-        .expect("Tracing subscriber in benchmark");
-    debug!("Running on thread {:?}", std::thread::current().id());
-    let mut group = c.benchmark_group("Calibrate");
-    let count = 100000;
-    let tokio_executor = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(8)
-        .thread_name("calibrate-limit")
-        .thread_stack_size(4 * 1024 * 1024)
-        .build()
-        .unwrap();
-    group.bench_with_input(
-        BenchmarkId::new("calibrate-limit", count),
-        &count,
-        |b, &_s| {
-            // Insert a call to `to_async` to convert the bencher to async mode.
-            // The timing loops are the same as with the normal bencher.
-            b.to_async(&tokio_executor).iter(|| capacity(count));
-        },
-    );
-
-    group.finish();
-}
-
-criterion_group! {
-    name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(3, Output::Protobuf));
-    targets = calibrate_limit
-}
-
-criterion_main!(benches);
