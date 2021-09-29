@@ -13,6 +13,7 @@ http-client = {version = "6.5.1", features = ["h1_client"]}
 http-types = "2.12.0"
 hyper = { version = "0.14", features = ["full", "runtime"] }
 lazy_static = "1.4.0"
+mio = "0.7.13"
 num_cpus = "1.13.0"
 surf = {version = "2.3.1", features = ["h1-client"] }
 tokio = { version = "^1.8", features = [
