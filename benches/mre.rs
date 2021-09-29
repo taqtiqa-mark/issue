@@ -6,6 +6,15 @@ use std::time;
 use tracing::{self, debug};
 use tracing::instrument;
 
+/// Table of Contents
+///
+///     LoC Description
+///   26-62 Setup Streams for HTTP client
+///   63-99 Start Server and Client
+/// 100-142 Criterion Setup
+/// 143-305 Server Code
+///
+
 /// Setup Streams for HTTP GET
 ///
 /// Invoke client to get URL, return a stream of response durations.
@@ -39,7 +48,6 @@ fn make_stream<'a>(
         .buffer_unordered(concurrency_limit)
 }
 
-//  statement: &'static URL,
 #[instrument]
 async fn run_stream(session: surf::Client, count: usize) {
     let handle = tokio::task::spawn(async move {
@@ -53,6 +61,7 @@ async fn run_stream(session: surf::Client, count: usize) {
     handle.await.expect("Client task");
 }
 
+// Start HTTP Server, Setup the HTTP client and Run the Stream
 #[instrument]
 async fn capacity(count: usize) {
     let mut server = Some(spawn_server());
@@ -90,7 +99,7 @@ async fn capacity(count: usize) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Criterion setup
+// Criterion Setup
 //
 // The hang behaviour is intermittent.
 // We use Criterion to run 100 iterations which should be sufficient to
@@ -133,7 +142,7 @@ criterion_group! {
 criterion_main!(benches);
 
 ////////////////////////////////////////////////////////////////////////////////
-// Server setup
+// Server Code
 //
 // This rules out anything Hyper server related.
 // This also means the example is self contained, hence reproducible
