@@ -265,6 +265,7 @@ async fn serve() {
                 stream.readable().await.expect("A readable TCP stream.");
                 let (stream, _) = socket.unwrap();
                 srv_process(stream, h).await;
+                return;
                 //continue;
                 //debug!("Sending to channel #: {}", next);
                 // Skip when socket closed
@@ -280,6 +281,7 @@ async fn serve() {
             Err(e) if connection_error(e) => {
                 debug!("Connection error: {}", e);
                 //break;
+                //return;
             }
             // Ignore socket errors like "Too many open files" on the OS
             // level. We need to sleep for a bit because the socket is not
@@ -291,6 +293,7 @@ async fn serve() {
                 let ten_millis = time::Duration::from_millis(10);
                 std::thread::sleep(ten_millis);
                 //break;
+                return;
             }
         }
     }
@@ -391,11 +394,10 @@ fn make_stream<'a>(
     // statement: &'a URL,
     count: usize,
 ) -> impl futures::Stream + 'a {
-    let concurrency_limit = 500;
+    let concurrency_limit = 20;
 
     futures::stream::iter(0..count)
         .map(move |_| async move {
-            //let statement = statement;
             debug!("Concurrently iterating client code as future");
             let query_start = tokio::time::Instant::now();
             let mut response = session.get("/").await.expect("Surf response");
@@ -437,22 +439,22 @@ async fn run_srv_stream(count: usize) {
 async fn run_stream_ct(session: std::sync::Arc<surf::Client>, count: usize) {
     let handle = tokio::task::spawn(async move {
         use std::convert::TryInto;
-        let session2: surf::Client = surf::Config::new()
-            .set_http_client(http_client::h1::H1Client::new())
-            .set_base_url(URL.clone())
-            //.set_timeout(Some(std::time::Duration::from_secs(180)))
-            .set_tcp_no_delay(true)
-            .set_http_keep_alive(true)
-            .set_max_connections_per_host(10)
-            .try_into()
-            .unwrap();
+        // let session2: surf::Client = surf::Config::new()
+        //     .set_http_client(http_client::h1::H1Client::new())
+        //     .set_base_url(URL.clone())
+        //     //.set_timeout(Some(std::time::Duration::from_secs(180)))
+        //     .set_tcp_no_delay(true)
+        //     .set_http_keep_alive(true)
+        //     .set_max_connections_per_host(10)
+        //     .try_into()
+        //     .unwrap();
         // let rt = tokio::runtime::Builder::new_current_thread()
         //     .enable_all()
         //     .build()
         //     .unwrap();
         // //let local = tokio::task::LocalSet::new();
         //local.spawn_local(async move {
-        let session = &session2;
+        let session = &session;
         debug!("About to make stream");
         let mut stream = make_stream(session, count);
         while let Some(_duration) = stream.next().await {
@@ -518,7 +520,7 @@ async fn capacity(count: usize) {
         .set_timeout(Some(std::time::Duration::from_secs(5)))
         .set_tcp_no_delay(true)
         .set_http_keep_alive(true)
-        .set_max_connections_per_host(500)
+        .set_max_connections_per_host(50)
         .try_into()
         .unwrap();
     let session = std::sync::Arc::new(session);
