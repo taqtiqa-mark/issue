@@ -1,7 +1,9 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use futures::StreamExt;
+use lazy_static::lazy_static; // 1.4.0
 use pprof::criterion::{Output, PProfProfiler};
 use std::io::{Read, Write};
+use std::sync::Mutex;
 use std::time;
 use tracing::{self, debug};
 use tracing::instrument;
@@ -23,42 +25,62 @@ use tracing::instrument;
 ///
 /// For a detailed description of this setup, see:
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
+
 #[instrument]
 fn make_stream<'a>(
-    session: &'a surf::Client,
-    count: usize,
+    client: &'a Client<String>,
 ) -> impl futures::Stream + 'a {
 
-    let concurrency_limit = 5000;
+    let concurrency_limit = 1000;
 
-    futures::stream::iter(0..count)
-        .map(move |_| async move {
-            debug!("Concurrently iterating client code as future");
+    let it = client.addresses.iter().cycle().take(client.count).cloned();
+    let vec = it.collect::<Vec<String>>().to_vec();
+    let v: Vec<&'static str> = vec.iter().map(std::ops::Deref::deref).collect::<Vec<&'static str>>().to_vec();
+    let strm = async_stream::stream! {
+        for i in 0..client.count {
             let query_start = tokio::time::Instant::now();
-            // This is for Hyper client use case
-            // let mut response = session.get("/").await.expect("Hyper response");
-            // let (parts, body) = response.unwrap().into_parts();
-            //
+            let response = client.session.get(hyper::Uri::from_static(v[i])).await.expect("Hyper response");
+            let (parts, body) = response.into_parts();
             // This is for Surf client use case
-            let mut response = session.get("/").await.expect("Surf response");
-            let body = response.body_string().await.expect("Surf body");
-            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
-            query_start.elapsed()
-        })
-        .buffer_unordered(concurrency_limit)
+            //let mut response = session.get("/").await.expect("Surf response");
+            //let body = response.body_string().await.expect("Surf body");
+            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", parts.status, body);
+            yield futures::future::ready(query_start.elapsed());
+        }
+    };
+    strm.buffer_unordered(concurrency_limit)
+    // let strm = futures::stream::iter(0..count)
+    //     .map(move |i| async move {
+    //         debug!("Concurrently iterating client code as future");
+    //         let query_start = tokio::time::Instant::now();
+    //         // This is for Hyper client use case
+    //         // let address = it.next().unwrap().clone();
+    //         // let a = address.clone().as_str().clone();
+    //         let response = session.get(hyper::Uri::from_static(v[i])).await.expect("Hyper response");
+    //         let (parts, body) = response.into_parts();
+    //         // This is for Surf client use case
+    //         //let mut response = session.get("/").await.expect("Surf response");
+    //         //let body = response.body_string().await.expect("Surf body");
+    //         debug!("\nSTATUS:{:?}\nBODY:\n{:?}", parts.status, body);
+    //         query_start.elapsed()
+    //     })
+    //     .buffer_unordered(concurrency_limit);
+    //     strm
 }
 
 #[instrument]
-async fn run_stream(session: surf::Client, count: usize) {
-    let handle = tokio::task::spawn(async move {
-        let session = &session;
-        debug!("About to make stream");
-        let mut stream = make_stream(session, count);
-        while let Some(_duration) = stream.next().await {
-            debug!("Stream next polled.");
-        }
-    });
-    handle.await.expect("Client task");
+async fn run_stream(client: &'static Client<String>,) {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async move {
+        tokio::task::spawn(async move {
+            debug!("About to make stream");
+            let stream = make_stream(client);
+            futures_util::pin_mut!(stream);
+            while let Some(_duration) = stream.next().await {
+                debug!("Stream next polled.");
+            }
+        }).await.expect("Client task");
+    }).await;
 }
 
 // Start HTTP Server, Setup the HTTP client and Run the Stream
@@ -75,23 +97,26 @@ async fn capacity(count: usize) {
         println!("The server was NOT spawned!");
     };
     debug!("About to init client");
-    //let session = hyper::Client::new();
-    use std::convert::TryInto;
-    let session: surf::Client = surf::Config::new()
-        .set_http_client(http_client::h1::H1Client::new())
-        .set_base_url(surf::Url::parse("http://127.0.0.1:8888").unwrap())
-        .set_timeout(Some(std::time::Duration::from_secs(5)))
-        .set_tcp_no_delay(true)
-        .set_http_keep_alive(true)
-        .set_max_connections_per_host(50)
-        .try_into()
-        .unwrap();
+    let client = Client::<String>::new();
+    // use std::convert::TryInto;
+    // let session: surf::Client = surf::Config::new()
+    //     .set_http_client(http_client::h1::H1Client::new())
+    //     .set_base_url(surf::Url::parse("http://127.0.0.1:8888").unwrap())
+    //     .set_timeout(Some(std::time::Duration::from_secs(5)))
+    //     .set_tcp_no_delay(true)
+    //     .set_http_keep_alive(true)
+    //     .set_max_connections_per_host(50)
+    //     .try_into()
+    //     .unwrap();
     let benchmark_start = tokio::time::Instant::now();
-    let ftr = run_stream(session.clone(), count);
+    let ftr = run_stream(&client);
     ftr.await;
+    // let ftr2 = run_stream(&client);
+    // ftr2.await;
     // Stop the server thread using the channel pattern...
     // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
     drop(server.take().expect("MIO server stopped"));
+    drop(client);
     println!(
         "Throughput: {:.1} request/s",
         1000000.0 * count as f64 / benchmark_start.elapsed().as_micros() as f64
@@ -101,7 +126,7 @@ async fn capacity(count: usize) {
 ////////////////////////////////////////////////////////////////////////////////
 // Criterion Setup
 //
-// The hang behaviour is intermittent.
+// The hang behavior is intermittent.
 // We use Criterion to run 100 iterations which should be sufficient to
 // generate at least one hang across different users/machines.
 //
@@ -142,11 +167,47 @@ criterion_group! {
 criterion_main!(benches);
 
 ////////////////////////////////////////////////////////////////////////////////
+// Utility Code
+//
+#[derive(Clone,Debug)]
+struct Client<T> {
+    addresses: std::vec::Vec<T>,
+    session: hyper::Client<hyper::client::HttpConnector>,
+    count: usize,
+}
+
+impl Client<String> {
+    fn new() -> Self {
+        Default::default()
+    }
+
+    fn add_address(&mut self) -> std::vec::Vec<String> {
+        let listener = mio::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        self.addresses.push(address);
+        self.addresses
+    }
+}
+
+impl<T: 'static> Default for Client<T> {
+    fn default() -> Self {
+        Client {
+            addresses: vec![],
+            session: hyper::Client::new(),
+            count: 1,
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Server Code
 //
 // This rules out anything Hyper server related.
 // This also means the example is self contained, hence reproducible
 //
+lazy_static! {
+    static ref ADDR_VEC: Mutex<Vec<String>> = Mutex::new(vec![]);
+}
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
 Connection: keep-alive
@@ -191,7 +252,8 @@ fn spawn_server() -> std::sync::mpsc::Sender<Msg> {
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
 fn init_mio_server() {
-    let address = "127.0.0.1:8888";
+    let address = "";
+    //ADDR_VEC.lock().unwrap().push(address.clone());
     let mut listener = reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to addr");
     let mut poll = mio::Poll::new().unwrap();
     poll.registry().register(
