@@ -20,6 +20,6 @@ go tool pprof -svg profile300.gz ./../target/criterion/Calibrate/calibrate-limit
 ## MIO TCP Server
 
 ```bash
-cargo bench --example tcp --profile release -Z unstable-options
+cargo run --example tcp --profile release -Z unstable-options
 wrk -d 30s -t 4 -c 128 http://127.0.0.1:8080/
 ```
