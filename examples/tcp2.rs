@@ -31,7 +31,7 @@ Content-Length: 6
 hello
 ";
 
-async fn process(stream: TcpStream) -> io::Result<()> {
+async fn process(stream: async_std::net::TcpStream) -> async_std::io::Result<()> {
     // debug!("Accepted from: {}", stream.peer_addr()?);
     let mut writer = stream;
     writer.write(RESPONSE.as_bytes()).await.unwrap();

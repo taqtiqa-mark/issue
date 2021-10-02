@@ -46,3 +46,33 @@ Running 30s test @ http://127.0.0.1:8080/
 Requests/sec:   8224.50
 Transfer/sec:    706.79KB
 ```
+
+## TCP v3: StdLib sync, backpressure (9k)
+
+```bash
+$ wrk -d 30s -t 4 -c 128 http://127.0.0.1:7878/
+Running 30s test @ http://127.0.0.1:7878/
+  4 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     6.91ms    7.14ms  67.68ms   85.71%
+    Req/Sec     2.49k   807.17     5.62k    67.05%
+  296466 requests in 30.08s, 24.88MB read
+  Socket errors: connect 0, read 34818, write 261634, timeout 0
+Requests/sec:   9854.39
+Transfer/sec:    846.86KB```
+```
+
+## TCP v4: StdLib sync, no-backpressure (11k)
+
+```bash
+$ wrk -d 30s -t 4 -c 128 http://127.0.0.1:7878/
+Running 30s test @ http://127.0.0.1:7879/
+  4 threads and 128 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     5.81ms    5.89ms  67.65ms   84.71%
+    Req/Sec     2.96k   783.08     5.67k    63.28%
+  352359 requests in 30.09s, 29.57MB read
+  Socket errors: connect 0, read 41043, write 311315, timeout 0
+Requests/sec:  11711.94
+Transfer/sec:      0.98MB
+```
