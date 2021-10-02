@@ -16,3 +16,10 @@ go tool pprof -http=:8080 ./target/criterion/Calibrate/calibrate-limit/100000/pr
 
 go tool pprof -svg profile300.gz ./../target/criterion/Calibrate/calibrate-limit/100000/profile/profile.pb
 ```
+
+## MIO TCP Server
+
+```bash
+cargo bench --example tcp --profile release -Z unstable-options
+wrk -d 30s -t 4 -c 128 http://127.0.0.1:8080/
+```
