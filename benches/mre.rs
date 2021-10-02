@@ -27,7 +27,7 @@ use tracing::{self, debug};
 
 #[instrument]
 fn make_stream<'client>(client: Client<String>) -> impl futures::Stream + 'client {
-    let concurrency_limit = 5;
+    let concurrency_limit = 5000;
 
     let it = client.addresses.iter().cycle().take(client.count).cloned();
     let vec = it.collect::<Vec<String>>();

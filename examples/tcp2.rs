@@ -32,7 +32,7 @@ hello
 ";
 
 async fn process(stream: TcpStream) -> io::Result<()> {
-    println!("Accepted from: {}", stream.peer_addr()?);
+    // debug!("Accepted from: {}", stream.peer_addr()?);
     let mut writer = stream;
     writer.write(RESPONSE.as_bytes()).await.unwrap();
     Ok(())
