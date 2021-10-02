@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
+async-std = "1.10.0"
 async-stream = "0.3"
 async-trait = "0.1"
 deadpool = { version = "0.8.2", features = ["managed", "rt_tokio_1"]}
