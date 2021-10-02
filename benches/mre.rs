@@ -4,9 +4,8 @@ use lazy_static::lazy_static; // 1.4.0
 use pprof::criterion::{Output, PProfProfiler};
 use std::io::{Read, Write};
 use std::sync::Mutex;
-use std::time;
-use tracing::{self, debug};
 use tracing::instrument;
+use tracing::{self, debug};
 
 /// Table of Contents
 ///
@@ -27,77 +26,64 @@ use tracing::instrument;
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
 
 #[instrument]
-fn make_stream<'a>(
-    client: &'a Client<String>,
-) -> impl futures::Stream + 'a {
-
-    let concurrency_limit = 1000;
+fn make_stream<'client>(client: Client<String>) -> impl futures::Stream + 'client {
+    let concurrency_limit = 5;
 
     let it = client.addresses.iter().cycle().take(client.count).cloned();
-    let vec = it.collect::<Vec<String>>().to_vec();
-    let v: Vec<&'static str> = vec.iter().map(std::ops::Deref::deref).collect::<Vec<&'static str>>().to_vec();
+    let vec = it.collect::<Vec<String>>();
+    let mut url: String = "http://".to_owned();
     let strm = async_stream::stream! {
         for i in 0..client.count {
             let query_start = tokio::time::Instant::now();
-            let response = client.session.get(hyper::Uri::from_static(v[i])).await.expect("Hyper response");
-            let (parts, body) = response.into_parts();
+            url.push_str(&vec[i]);
+            let _response = client.session.get(url.parse::<hyper::Uri>().unwrap()).await.expect("Hyper response");
+            // let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
+            // let (parts, body) = response.into_parts();
             // This is for Surf client use case
             //let mut response = session.get("/").await.expect("Surf response");
             //let body = response.body_string().await.expect("Surf body");
-            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", parts.status, body);
+            // debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), response.body());
             yield futures::future::ready(query_start.elapsed());
         }
     };
     strm.buffer_unordered(concurrency_limit)
-    // let strm = futures::stream::iter(0..count)
-    //     .map(move |i| async move {
-    //         debug!("Concurrently iterating client code as future");
-    //         let query_start = tokio::time::Instant::now();
-    //         // This is for Hyper client use case
-    //         // let address = it.next().unwrap().clone();
-    //         // let a = address.clone().as_str().clone();
-    //         let response = session.get(hyper::Uri::from_static(v[i])).await.expect("Hyper response");
-    //         let (parts, body) = response.into_parts();
-    //         // This is for Surf client use case
-    //         //let mut response = session.get("/").await.expect("Surf response");
-    //         //let body = response.body_string().await.expect("Surf body");
-    //         debug!("\nSTATUS:{:?}\nBODY:\n{:?}", parts.status, body);
-    //         query_start.elapsed()
-    //     })
-    //     .buffer_unordered(concurrency_limit);
-    //     strm
 }
 
 #[instrument]
-async fn run_stream(client: &'static Client<String>,) {
+async fn run_stream(client: Client<String>) {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async move {
-        tokio::task::spawn(async move {
-            debug!("About to make stream");
-            let stream = make_stream(client);
-            futures_util::pin_mut!(stream);
-            while let Some(_duration) = stream.next().await {
-                debug!("Stream next polled.");
-            }
-        }).await.expect("Client task");
-    }).await;
+    local
+        .run_until(async move {
+            tokio::task::spawn(async move {
+                debug!("About to make stream");
+                let stream = make_stream(client);
+                futures_util::pin_mut!(stream);
+                while let Some(_duration) = stream.next().await {
+                    debug!("Stream next polled.");
+                }
+            })
+            .await
+            .expect("Client task");
+        })
+        .await;
 }
 
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 #[instrument]
 async fn capacity(count: usize) {
-    let mut server = Some(spawn_server());
+    debug!("About to init client");
+    let mut client = Client::<String>::new();
+    let address = client.add_address();
+    let server = Some(spawn_server(address));
     if let Some(ref server) = server {
         // Any String will start the server...
         server.send(Msg::Echo("Start".to_string())).unwrap();
-        let secs = time::Duration::from_millis(2000);
-        std::thread::sleep(secs);
+        let secs = tokio::time::Duration::from_millis(2000);
+        tokio::time::sleep(secs).await;
         println!("The server WAS spawned!");
     } else {
         println!("The server was NOT spawned!");
     };
-    debug!("About to init client");
-    let client = Client::<String>::new();
     // use std::convert::TryInto;
     // let session: surf::Client = surf::Config::new()
     //     .set_http_client(http_client::h1::H1Client::new())
@@ -109,14 +95,15 @@ async fn capacity(count: usize) {
     //     .try_into()
     //     .unwrap();
     let benchmark_start = tokio::time::Instant::now();
-    let ftr = run_stream(&client);
+    let client = client.clone();
+    let ftr = run_stream(client);
     ftr.await;
     // let ftr2 = run_stream(&client);
     // ftr2.await;
     // Stop the server thread using the channel pattern...
     // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
-    drop(server.take().expect("MIO server stopped"));
-    drop(client);
+    //drop(server.take().expect("MIO server stopped"));
+    // drop(client);
     println!(
         "Throughput: {:.1} request/s",
         1000000.0 * count as f64 / benchmark_start.elapsed().as_micros() as f64
@@ -137,7 +124,7 @@ fn calibrate_limit(c: &mut Criterion) {
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
-    let count = 100000;
+    let count = 2;
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(8)
@@ -154,7 +141,6 @@ fn calibrate_limit(c: &mut Criterion) {
             b.to_async(&tokio_executor).iter(|| capacity(count));
         },
     );
-
     group.finish();
 }
 
@@ -169,7 +155,7 @@ criterion_main!(benches);
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Code
 //
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 struct Client<T> {
     addresses: std::vec::Vec<T>,
     session: hyper::Client<hyper::client::HttpConnector>,
@@ -181,11 +167,13 @@ impl Client<String> {
         Default::default()
     }
 
-    fn add_address(&mut self) -> std::vec::Vec<String> {
+    fn add_address(&mut self) -> std::string::String {
         let listener = mio::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        self.addresses.push(address);
-        self.addresses
+        let mut url: String = "".to_owned();
+        url.push_str(&address);
+        self.addresses.push(url.clone());
+        url
     }
 }
 
@@ -233,14 +221,14 @@ enum Msg {
     Echo(String),
 }
 
-fn spawn_server() -> std::sync::mpsc::Sender<Msg> {
+fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         while let Ok(msg) = rx.recv() {
             match msg {
                 Msg::Echo(_msg) => {
-                    init_mio_server();
-                },
+                    init_mio_server(address.clone());
+                }
             }
         }
         println!("The server has stopped!");
@@ -251,17 +239,14 @@ fn spawn_server() -> std::sync::mpsc::Sender<Msg> {
 // We need a server that eliminates Hyper server code as an explanation.
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
-fn init_mio_server() {
-    let address = "";
-    //ADDR_VEC.lock().unwrap().push(address.clone());
-    let mut listener = reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to addr");
+fn init_mio_server(address: std::string::String) {
+    debug!("{}", address);
+    let mut listener =
+        reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to URL");
     let mut poll = mio::Poll::new().unwrap();
-    poll.registry().register(
-        &mut listener,
-        mio::Token(0),
-        mio::Interest::READABLE
-    )
-    .unwrap();
+    poll.registry()
+        .register(&mut listener, mio::Token(0), mio::Interest::READABLE)
+        .unwrap();
 
     let mut counter: usize = 0;
     let mut sockets: std::collections::HashMap<mio::Token, mio::net::TcpStream> =
@@ -281,12 +266,9 @@ fn init_mio_server() {
                             counter += 1;
                             let token = mio::Token(counter);
 
-                            poll.registry().register(
-                                &mut socket,
-                                token,
-                                mio::Interest::READABLE
-                            )
-                            .unwrap();
+                            poll.registry()
+                                .register(&mut socket, token, mio::Interest::READABLE)
+                                .unwrap();
 
                             sockets.insert(token, socket);
                             requests.insert(token, Vec::with_capacity(8192));
@@ -322,12 +304,13 @@ fn init_mio_server() {
                         .is_some();
 
                     if ready {
-                        poll.registry().reregister(
-                            sockets.get_mut(&token).unwrap(),
-                            token,
-                            mio::Interest::WRITABLE
-                        )
-                        .unwrap();
+                        poll.registry()
+                            .reregister(
+                                sockets.get_mut(&token).unwrap(),
+                                token,
+                                mio::Interest::WRITABLE,
+                            )
+                            .unwrap();
                     }
                 }
                 token if event.is_writable() => {
@@ -339,12 +322,13 @@ fn init_mio_server() {
                         .unwrap();
 
                     // Re-use existing connection ("keep-alive") - switch back to reading
-                    poll.registry().reregister(
-                        sockets.get_mut(&token).unwrap(),
-                        token,
-                        mio::Interest::READABLE
-                    )
-                    .unwrap();
+                    poll.registry()
+                        .reregister(
+                            sockets.get_mut(&token).unwrap(),
+                            token,
+                            mio::Interest::READABLE,
+                        )
+                        .unwrap();
                 }
                 _ => unreachable!(),
             }
