@@ -10,10 +10,11 @@ use tracing::{self, debug};
 /// Table of Contents
 ///
 ///     LoC Description
-///   26-62 Setup Streams for HTTP client
-///   63-99 Start Server and Client
-/// 100-142 Criterion Setup
-/// 143-305 Server Code
+///   26-69 Setup Streams for HTTP GET
+///  70-126 Start Server and Client
+/// 127-170 Criterion Setup
+/// 171-208 Utility Code
+/// 209-371 Server Code
 ///
 
 /// Setup Streams for HTTP GET
@@ -22,7 +23,7 @@ use tracing::{self, debug};
 /// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
 /// Async code runs on the caller thread.
 ///
-/// For a detailed description of this setup, see:
+/// For a detailed description of this client Stream setup, see:
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
 
 #[instrument]
@@ -68,21 +69,34 @@ async fn run_stream(client: Client<String>) {
         .await;
 }
 
-// Start HTTP Server, Setup the HTTP client and Run the Stream
+///////////////////////////////////////////////////////////////////////////////
+//
+// Start Server and Client
+//
+// Start HTTP Server, Setup HTTP client and run the Stream
+//
 #[instrument]
 async fn capacity(count: usize) {
     debug!("About to init client");
     let mut client = Client::<String>::new();
-    let address = client.add_address();
-    let server = Some(spawn_server(address));
-    if let Some(ref server) = server {
-        // Any String will start the server...
-        server.send(Msg::Echo("Start".to_string())).unwrap();
-        let secs = tokio::time::Duration::from_millis(2000);
+    let mut servers = vec![];
+    let num_threads = 1;//num_cpus::get();
+    for _i in 0..num_threads {
+        let address = client.add_address();
+        println!("Serving on {}", address);
+        let server = Some(spawn_server(address));
+        if let Some(ref server) = server {
+            // Any String will start the server...
+            server.send(Msg::Echo("Start".to_string())).await.expect("Send start message");
+            let secs = tokio::time::Duration::from_millis(2000);
+            tokio::time::sleep(secs).await;
+            println!("The server WAS spawned!");
+        } else {
+            println!("The server was NOT spawned!");
+        };
+        servers.push(server);
+        let secs = tokio::time::Duration::from_millis(5000);
         tokio::time::sleep(secs).await;
-        println!("The server WAS spawned!");
-    } else {
-        println!("The server was NOT spawned!");
     };
     // use std::convert::TryInto;
     // let session: surf::Client = surf::Config::new()
@@ -98,12 +112,16 @@ async fn capacity(count: usize) {
     let client = client.clone();
     let ftr = run_stream(client);
     ftr.await;
+    // This is an attempt to saturate the CPU - but it halves throughput!
     // let ftr2 = run_stream(&client);
     // ftr2.await;
     // Stop the server thread using the channel pattern...
     // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
     //drop(server.take().expect("MIO server stopped"));
     // drop(client);
+    for server in servers {
+        drop(server);
+    }
     println!(
         "Throughput: {:.1} request/s",
         1000000.0 * count as f64 / benchmark_start.elapsed().as_micros() as f64
@@ -153,6 +171,7 @@ criterion_group! {
 criterion_main!(benches);
 
 ////////////////////////////////////////////////////////////////////////////////
+//
 // Utility Code
 //
 #[derive(Clone, Debug)]
@@ -221,10 +240,11 @@ enum Msg {
     Echo(String),
 }
 
-fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
+fn spawn_server(address: std::string::String) -> async_std::channel::Sender<Msg> {
+    // let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = async_std::channel::unbounded();
+    std::thread::spawn(move || async move{
+        while let Ok(msg) = rx.recv().await {
             match msg {
                 Msg::Echo(_msg) => {
                     init_mio_server(address.clone());
@@ -240,7 +260,7 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
 fn init_mio_server(address: std::string::String) {
-    debug!("{}", address);
+    debug!("Starting MIO server at: {}", address);
     let mut listener =
         reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to URL");
     let mut poll = mio::Poll::new().unwrap();
