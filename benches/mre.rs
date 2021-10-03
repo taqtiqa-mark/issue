@@ -37,13 +37,13 @@ fn make_stream<'client>(client: Client<String>) -> impl futures::Stream + 'clien
         for i in 0..client.count {
             let query_start = tokio::time::Instant::now();
             url.push_str(&vec[i]);
-            let _response = client.session.get(url.parse::<hyper::Uri>().unwrap()).await.expect("Hyper response");
-            // let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
+            let mut response = client.session.get(url.parse::<hyper::Uri>().unwrap()).await.expect("Hyper response");
+            let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
             // let (parts, body) = response.into_parts();
             // This is for Surf client use case
             //let mut response = session.get("/").await.expect("Surf response");
             //let body = response.body_string().await.expect("Surf body");
-            // debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), response.body());
+            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
             yield futures::future::ready(query_start.elapsed());
         }
     };
@@ -123,7 +123,7 @@ fn calibrate_limit(c: &mut Criterion) {
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
-    let count = 2;
+    let count = 100000;
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(8)
