@@ -28,7 +28,7 @@ use tracing::{self, debug};
 
 #[instrument]
 fn make_stream<'client>(client: Client<String>) -> impl futures::Stream + 'client {
-    let concurrency_limit = 5000;
+    let concurrency_limit = 5000000;
 
     let it = client.addresses.iter().cycle().take(client.count).cloned();
     let vec = it.collect::<Vec<String>>();
@@ -123,7 +123,7 @@ fn calibrate_limit(c: &mut Criterion) {
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
-    let count = 100000;
+    let count = 200000000;
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(8)
@@ -238,6 +238,28 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
 // We need a server that eliminates Hyper server code as an explanation.
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
+pub const NAMESPACE_ISSUE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x6b, 0xa7, 0xb8, 0x10,
+    0x9d, 0xad, 0x11, 0xd1,
+    0x80, 0xb4, 0x00, 0xc0,
+    0x4f, 0xd4, 0x30, 0xc8,
+]);
+fn response() -> String {
+    // simulate some work being done
+    let handle = std::thread::spawn(move || {
+        let mut buf = [b'!'; 49];
+        let uuid = uuid::Uuid::new_v5(&NAMESPACE_ISSUE, "issue".as_bytes());
+        // .expect("Generate UUID");
+        uuid.to_urn().encode_lower(&mut buf);
+        let secs = std::time::Duration::from_millis(65);
+        std::thread::sleep(secs);
+        // debug!("UUID: {}", uuid);
+    });
+    handle.join();
+    let response = "HTTP/1.1 200 OK\nContent-Type: text/html\nConnection: keep-alive\nContent-Length: 13\n\nHello World!\n".to_string();
+    response
+}
+
 fn init_mio_server(address: std::string::String) {
     debug!("{}", address);
     let mut listener =
