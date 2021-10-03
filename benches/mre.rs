@@ -28,7 +28,7 @@ use tracing::{self, debug};
 
 #[instrument]
 fn make_stream<'client>(client: Client<String>) -> impl futures::Stream + 'client {
-    let concurrency_limit = 5000000;
+    let concurrency_limit = 5_000;
 
     let it = client.addresses.iter().cycle().take(client.count).cloned();
     let vec = it.collect::<Vec<String>>();
@@ -77,8 +77,9 @@ async fn run_stream(client: Client<String>) {
 //
 #[instrument]
 async fn capacity(count: usize) {
-    debug!("About to init client");
+    debug!("Initialize client");
     let mut client = Client::<String>::new();
+    client.count = count;
     let address = client.add_address();
     let server = Some(spawn_server(address));
     if let Some(ref server) = server {
@@ -123,7 +124,7 @@ fn calibrate_limit(c: &mut Criterion) {
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
-    let count = 200000000;
+    let count = 100_000;
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(8)
@@ -198,7 +199,7 @@ lazy_static! {
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
 Connection: keep-alive
-Content-Length: 13
+Content-Length: 14
 
 Hello World!
 ";
@@ -238,25 +239,37 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
 // We need a server that eliminates Hyper server code as an explanation.
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
-pub const NAMESPACE_ISSUE: uuid::Uuid = uuid::Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x10,
-    0x9d, 0xad, 0x11, 0xd1,
-    0x80, 0xb4, 0x00, 0xc0,
-    0x4f, 0xd4, 0x30, 0xc8,
-]);
-fn response() -> String {
+fn response<'response>() -> String {
     // simulate some work being done
-    let handle = std::thread::spawn(move || {
-        let mut buf = [b'!'; 49];
-        let uuid = uuid::Uuid::new_v5(&NAMESPACE_ISSUE, "issue".as_bytes());
-        // .expect("Generate UUID");
-        uuid.to_urn().encode_lower(&mut buf);
-        let secs = std::time::Duration::from_millis(65);
-        std::thread::sleep(secs);
-        // debug!("UUID: {}", uuid);
-    });
-    handle.join();
-    let response = "HTTP/1.1 200 OK\nContent-Type: text/html\nConnection: keep-alive\nContent-Length: 13\n\nHello World!\n".to_string();
+    let uuidv4: uuid::Uuid;
+    let uuidv5: uuid::Uuid;
+    // let handle = std::thread::spawn(move || {
+    let mut buf = [b'!'; 49];
+    let uuidv4 = uuid::Uuid::new_v4();
+    let uuidv5 = uuid::Uuid::new_v5(&uuidv4, "issue".as_bytes());
+    // .expect("Generate UUID");
+    uuidv5.to_urn().encode_lower(&mut buf);
+    let secs = std::time::Duration::from_millis(65);
+    std::thread::sleep(secs);
+    // debug!("UUID: {}", uuid);
+    // });
+    // handle.join();
+    let response = format!(
+        r#"
+HTTP/1.1 200 OK
+Content-Type: text/json
+Connection: keep-alive
+Content-Length: 103
+
+{{
+    "v4": "{}",
+    "v5": "{}"
+}}
+"#,
+        uuidv4.to_hyphenated(),
+        uuidv5.to_hyphenated()
+    );
+    debug!("{}", response);
     response
 }
 
@@ -336,6 +349,8 @@ fn init_mio_server(address: std::string::String) {
                 }
                 token if event.is_writable() => {
                     requests.get_mut(&token).unwrap().clear();
+                    let response = &response()[..];
+                    debug!("{:?}", response);
                     sockets
                         .get_mut(&token)
                         .unwrap()
