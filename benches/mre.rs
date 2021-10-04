@@ -31,6 +31,7 @@ fn make_stream<'client>(client: Client<String>) -> impl futures::Stream<Item=tok
     let concurrency_limit = 10;
 
     let stream = async_stream::stream! {
+        // Allocate each stream to one of the servers started
         let it = client.addresses.iter().cycle().take(client.count).cloned();
         let vec = it.collect::<Vec<String>>();
         let urls = vec!["http://".to_owned(); client.count];
@@ -79,22 +80,28 @@ async fn run_stream(client: Client<String>) {
 //
 #[instrument]
 async fn capacity(mut client: Client<String>) {
-    debug!("About to init client");
-    let address = client.add_address();
-    let server = Some(spawn_server(address));
-    if let Some(ref server) = server {
-        // Any String will start the server...
-        server.send(Msg::Echo("Start".to_string())).unwrap();
-        let secs = tokio::time::Duration::from_millis(2000);
-        tokio::time::sleep(secs).await;
-        println!("The server WAS spawned!");
-    } else {
-        println!("The server was NOT spawned!");
+    println!("Initializing servers");
+    let mut servers = vec![];
+    for _ in 0..2*num_cpus::get() {
+        let address = client.add_address();
+        println!("  - Added address: {}", address);
+        servers.push(spawn_server(address));
+        if let Some(server) = servers.last() {
+            // Any String will start the server...
+            server.send(Msg::Start).unwrap();
+            let secs = tokio::time::Duration::from_millis(2000);
+            tokio::time::sleep(secs).await;
+            println!("    - The server WAS spawned!");
+        } else {
+            println!("    - The server was NOT spawned!");
+        };
     };
     let benchmark_start = tokio::time::Instant::now();
-    let count = client.count;
     let ftr = run_stream(client.clone());
     ftr.await;
+    for s in servers.iter() {
+        s.send(Msg::Stop).unwrap();
+    }
     println!(
         "Throughput: {:.1} request/s",
         1000000.0 * client.count as f64 / benchmark_start.elapsed().as_micros() as f64
@@ -211,16 +218,23 @@ fn is_double_crnl(window: &[u8]) -> bool {
 //
 // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
 enum Msg {
-    Echo(String),
+    Start,
+    Stop,
 }
 
 fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
+        while let Ok(msg) = &rx.recv() {
             match msg {
-                Msg::Echo(_msg) => {
+                Msg::Start => {
+                    println!("    - The server should start.");
                     init_mio_server(address.clone());
+                    println!("      - The server has started.");
+                },
+                Msg::Stop => {
+                    println!("    - The server should stop.");
+                    return;
                 }
             }
         }
@@ -233,9 +247,9 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
 fn init_mio_server(address: std::string::String) {
-    debug!("{}", address);
+    debug!("Server: {}", address);
     let mut listener =
-        reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to URL");
+        reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to address");
     let mut poll = mio::Poll::new().unwrap();
     poll.registry()
         .register(&mut listener, mio::Token(0), mio::Interest::READABLE)
