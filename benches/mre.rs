@@ -28,7 +28,7 @@ use tracing::{self, debug};
 
 #[instrument]
 fn make_stream<'client>(client: Client<String>) -> impl futures::Stream<Item=tokio::time::Duration> + 'client {
-    let concurrency_limit = 10;
+    let concurrency_limit = 100;
 
     let stream = async_stream::stream! {
         // Allocate each stream to one of the servers started
