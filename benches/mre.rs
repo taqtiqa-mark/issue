@@ -27,17 +27,19 @@ use tracing::{self, debug};
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
 
 #[instrument]
-fn make_stream<'client>(client: Client<String>) -> impl futures::Stream + 'client {
-    let concurrency_limit = 5000;
+fn make_stream<'client>(client: Client<String>) -> impl futures::Stream<Item=tokio::time::Duration> + 'client {
+    let concurrency_limit = 10;
 
-    let it = client.addresses.iter().cycle().take(client.count).cloned();
-    let vec = it.collect::<Vec<String>>();
-    let mut url: String = "http://".to_owned();
-    let strm = async_stream::stream! {
-        for i in 0..client.count {
+    let stream = async_stream::stream! {
+        let it = client.addresses.iter().cycle().take(client.count).cloned();
+        let vec = it.collect::<Vec<String>>();
+        let urls = vec!["http://".to_owned(); client.count];
+        let urls = urls.into_iter().zip(vec).map(|(s,t)|s+&t).collect::<Vec<String>>();
+        for url in urls.iter() {
             let query_start = tokio::time::Instant::now();
-            url.push_str(&vec[i]);
-            let mut response = client.session.get(url.parse::<hyper::Uri>().unwrap()).await.expect("Hyper response");
+            let url_parsed = &url.parse::<hyper::Uri>().unwrap();
+            debug!("URL String: {} URL Parsed: {}", &url, url_parsed);
+            let mut response = client.session.get(url_parsed.clone()).await.expect("Hyper response");
             let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
             // let (parts, body) = response.into_parts();
             // This is for Surf client use case
@@ -47,7 +49,7 @@ fn make_stream<'client>(client: Client<String>) -> impl futures::Stream + 'clien
             yield futures::future::ready(query_start.elapsed());
         }
     };
-    strm.buffer_unordered(concurrency_limit)
+    stream.buffer_unordered(concurrency_limit)
 }
 
 #[instrument]
@@ -76,9 +78,8 @@ async fn run_stream(client: Client<String>) {
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 //
 #[instrument]
-async fn capacity(count: usize) {
+async fn capacity(mut client: Client<String>) {
     debug!("About to init client");
-    let mut client = Client::<String>::new();
     let address = client.add_address();
     let server = Some(spawn_server(address));
     if let Some(ref server) = server {
@@ -91,21 +92,12 @@ async fn capacity(count: usize) {
         println!("The server was NOT spawned!");
     };
     let benchmark_start = tokio::time::Instant::now();
-    let client = client.clone();
-    let ftr = run_stream(client);
+    let count = client.count;
+    let ftr = run_stream(client.clone());
     ftr.await;
-    // This should increase throughput - but it halves it....
-    //
-    // let ftr2 = run_stream(&client);
-    // ftr2.await;
-    //
-    // Stop the server thread using the channel pattern...
-    // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
-    //drop(server.take().expect("MIO server stopped"));
-    // drop(client);
     println!(
         "Throughput: {:.1} request/s",
-        1000000.0 * count as f64 / benchmark_start.elapsed().as_micros() as f64
+        1000000.0 * client.count as f64 / benchmark_start.elapsed().as_micros() as f64
     );
 }
 
@@ -123,7 +115,8 @@ fn calibrate_limit(c: &mut Criterion) {
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
-    let count = 100000;
+    let mut client = Client::<String>::new();
+    client.count = 5_000;
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(8)
@@ -132,12 +125,12 @@ fn calibrate_limit(c: &mut Criterion) {
         .build()
         .unwrap();
     group.bench_with_input(
-        BenchmarkId::new("calibrate-limit", count),
-        &count,
-        |b, &_s| {
+        BenchmarkId::new("calibrate-limit", client.count),
+        &client,
+        |b, s| {
             // Insert a call to `to_async` to convert the bencher to async mode.
             // The timing loops are the same as with the normal bencher.
-            b.to_async(&tokio_executor).iter(|| capacity(count));
+            b.to_async(&tokio_executor).iter(|| capacity(s.clone()));
         },
     );
     group.finish();
@@ -171,6 +164,7 @@ impl Client<String> {
         let address = listener.local_addr().unwrap().to_string();
         let mut url: String = "".to_owned();
         url.push_str(&address);
+        debug!("Added address: {}", address);
         self.addresses.push(url.clone());
         url
     }
