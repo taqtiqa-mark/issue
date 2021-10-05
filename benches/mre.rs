@@ -27,7 +27,7 @@ use tracing::{self, debug};
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
 
 #[instrument]
-fn make_stream<'client>(client: Client<String>) -> impl futures::Stream<Item=tokio::time::Duration> + 'client {
+fn make_stream<'client>(client: &'client mut Client<String>) -> impl futures::Stream<Item=tokio::time::Duration> + 'client {
     let concurrency_limit = 100;
 
     let stream = async_stream::stream! {
@@ -35,7 +35,10 @@ fn make_stream<'client>(client: Client<String>) -> impl futures::Stream<Item=tok
         let it = client.addresses.iter().cycle().take(client.count).cloned();
         let vec = it.collect::<Vec<String>>();
         let urls = vec!["http://".to_owned(); client.count];
-        let urls = urls.into_iter().zip(vec).map(|(s,t)|s+&t).collect::<Vec<String>>();
+        let urls = urls.into_iter()
+                        .zip(vec)
+                        .map(|(s,t)|s+&t)
+                        .collect::<Vec<String>>();
         for url in urls.iter() {
             let query_start = tokio::time::Instant::now();
             let url_parsed = &url.parse::<hyper::Uri>().unwrap();
@@ -54,22 +57,49 @@ fn make_stream<'client>(client: Client<String>) -> impl futures::Stream<Item=tok
 }
 
 #[instrument]
-async fn run_stream(client: Client<String>) {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            tokio::task::spawn(async move {
-                debug!("About to make stream");
-                let stream = make_stream(client);
-                futures_util::pin_mut!(stream);
-                while let Some(_duration) = stream.next().await {
-                    debug!("Stream next polled.");
-                }
-            })
-            .await
-            .expect("Client task");
-        })
-        .await;
+async fn run_stream<'client>(client: &'client mut Client<String>) {
+    let num = 1*num_cpus::get();
+    // {
+        let mut counted = 0;
+        let default = client.clone();
+        let mut clients = vec![default.clone(); num];
+        //let it = clients.into_iter();
+    // let it = clients.iter_mut();
+    for i in 0..clients.len() {
+        // let local = tokio::task::LocalSet::new();
+        let mut client = clients[i].clone();
+        // local
+            // .run_until(async move {
+                // tokio::task::spawn_local(async move {
+                let sub_total = tokio::task::spawn(async move {
+
+                    debug!("About to make stream");
+                    let stream = make_stream(&mut client);
+                    futures_util::pin_mut!(stream);
+                    while let Some(_duration) = stream.next().await {
+                        debug!("Stream next polled.");
+                        counted += 1;
+                    }
+                    // let mut track = *client;
+                    //client.counted = counted;
+                    counted
+                })
+                .await
+                .expect("Client task");
+            clients[i].counted += sub_total;
+            debug!("Total client requests: {} Cummulative: {:?}", sub_total, clients[i])
+
+            // })
+            // .await;
+    // }
+    };
+    let mut total = 0;
+    let it = clients.into_iter();
+    for client in it {
+        total += client.counted;
+        println!("Cummulative Total: {}", total);
+    }
+    client.counted = total;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -91,20 +121,20 @@ async fn capacity(mut client: Client<String>) {
             server.send(Msg::Start).unwrap();
             let secs = tokio::time::Duration::from_millis(2000);
             tokio::time::sleep(secs).await;
-            println!("    - The server WAS spawned!");
+            debug!("    - The server WAS spawned!");
         } else {
             println!("    - The server was NOT spawned!");
         };
     };
     let benchmark_start = tokio::time::Instant::now();
-    let ftr = run_stream(client.clone());
+    let ftr = run_stream(&mut client);
     ftr.await;
     for s in servers.iter() {
         s.send(Msg::Stop).unwrap();
     }
     println!(
         "Throughput: {:.1} request/s",
-        1000000.0 * client.count as f64 / benchmark_start.elapsed().as_micros() as f64
+        1000000.0 * client.counted as f64 / benchmark_start.elapsed().as_micros() as f64
     );
 }
 
@@ -123,7 +153,7 @@ fn calibrate_limit(c: &mut Criterion) {
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
     let mut client = Client::<String>::new();
-    client.count = 5_000;
+    client.count = 50_000;
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(8)
@@ -134,10 +164,10 @@ fn calibrate_limit(c: &mut Criterion) {
     group.bench_with_input(
         BenchmarkId::new("calibrate-limit", client.count),
         &client,
-        |b, s| {
+        |b, c| {
             // Insert a call to `to_async` to convert the bencher to async mode.
             // The timing loops are the same as with the normal bencher.
-            b.to_async(&tokio_executor).iter(|| capacity(s.clone()));
+            b.to_async(&tokio_executor).iter(|| capacity(c.clone()));
         },
     );
     group.finish();
@@ -159,6 +189,7 @@ struct Client<T> {
     addresses: std::vec::Vec<T>,
     session: hyper::Client<hyper::client::HttpConnector>,
     count: usize,
+    counted: usize,
 }
 
 impl Client<String> {
@@ -183,6 +214,7 @@ impl<T: 'static> Default for Client<T> {
             addresses: vec![],
             session: hyper::Client::new(),
             count: 1,
+            counted: 0,
         }
     }
 }
@@ -228,17 +260,17 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
         while let Ok(msg) = &rx.recv() {
             match msg {
                 Msg::Start => {
-                    println!("    - The server should start.");
+                    debug!("    - The server should start.");
                     init_mio_server(address.clone());
-                    println!("      - The server has started.");
+                    debug!("      - The server has started.");
                 },
                 Msg::Stop => {
-                    println!("    - The server should stop.");
+                    debug!("    - The server should stop.");
                     return;
                 }
             }
         }
-        println!("The server has stopped!");
+        debug!("The server has stopped!");
     });
     tx
 }
