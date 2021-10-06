@@ -27,23 +27,28 @@ use tracing::{self, debug};
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
 
 #[instrument]
-fn make_stream<'client>(client: &'client mut Client<String>) -> impl futures::Stream<Item=tokio::time::Duration> + 'client {
-    let concurrency_limit = 100;
+fn make_stream<'client>(
+    client: &'client mut Client<String>,
+) -> impl futures::Stream<Item = tokio::time::Duration> + 'client {
+
+    let concurrency = client.concurrency;
 
     let stream = async_stream::stream! {
         // Allocate each stream to one of the servers started
-        let it = client.addresses.iter().cycle().take(client.count).cloned();
+        let it = client.addresses.iter().cycle().take(client.nstreams).cloned();
         let vec = it.collect::<Vec<String>>();
-        let urls = vec!["http://".to_owned(); client.count];
+        let urls = vec!["http://".to_owned(); client.nstreams];
         let urls = urls.into_iter()
                         .zip(vec)
                         .map(|(s,t)|s+&t)
                         .collect::<Vec<String>>();
+        let urls = urls.into_iter()
+                        .map(|u|u.parse::<hyper::Uri>().unwrap())
+                        .collect::<Vec<hyper::Uri>>();
         for url in urls.iter() {
             let query_start = tokio::time::Instant::now();
-            let url_parsed = &url.parse::<hyper::Uri>().unwrap();
-            debug!("URL String: {} URL Parsed: {}", &url, url_parsed);
-            let mut response = client.session.get(url_parsed.clone()).await.expect("Hyper response");
+            debug!("URL String: {} URL Parsed: {}", &url, url);
+            let mut response = client.session.get(url.clone()).await.expect("Hyper response");
             let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
             // let (parts, body) = response.into_parts();
             // This is for Surf client use case
@@ -53,46 +58,47 @@ fn make_stream<'client>(client: &'client mut Client<String>) -> impl futures::St
             yield futures::future::ready(query_start.elapsed());
         }
     };
-    stream.buffer_unordered(concurrency_limit)
+    stream.buffer_unordered(concurrency)
 }
 
 #[instrument]
 async fn run_stream<'client>(client: &'client mut Client<String>) {
-    let num = 1*num_cpus::get();
     // {
-        let mut counted = 0;
-        let default = client.clone();
-        let mut clients = vec![default.clone(); num];
-        //let it = clients.into_iter();
+    let mut counted = 0;
+    let default = client.clone();
+    let mut clients = vec![default.clone(); client.nclients];
+    //let it = clients.into_iter();
     // let it = clients.iter_mut();
     for i in 0..clients.len() {
         // let local = tokio::task::LocalSet::new();
         let mut client = clients[i].clone();
         // local
-            // .run_until(async move {
-                // tokio::task::spawn_local(async move {
-                let sub_total = tokio::task::spawn(async move {
+        // .run_until(async move {
+        // tokio::task::spawn_local(async move {
+        let sub_total = tokio::task::spawn(async move {
+            debug!("About to make stream");
+            let stream = make_stream(&mut client);
+            futures_util::pin_mut!(stream);
+            while let Some(_duration) = stream.next().await {
+                debug!("Stream next polled.");
+                counted += 1;
+            }
+            // let mut track = *client;
+            //client.counted = counted;
+            counted
+        })
+        .await
+        .expect("Client task");
+        clients[i].counted += sub_total;
+        debug!(
+            "Total client requests: {} Cummulative: {:?}",
+            sub_total, clients[i]
+        )
 
-                    debug!("About to make stream");
-                    let stream = make_stream(&mut client);
-                    futures_util::pin_mut!(stream);
-                    while let Some(_duration) = stream.next().await {
-                        debug!("Stream next polled.");
-                        counted += 1;
-                    }
-                    // let mut track = *client;
-                    //client.counted = counted;
-                    counted
-                })
-                .await
-                .expect("Client task");
-            clients[i].counted += sub_total;
-            debug!("Total client requests: {} Cummulative: {:?}", sub_total, clients[i])
-
-            // })
-            // .await;
-    // }
-    };
+        // })
+        // .await;
+        // }
+    }
     let mut total = 0;
     let it = clients.into_iter();
     for client in it {
@@ -110,28 +116,8 @@ async fn run_stream<'client>(client: &'client mut Client<String>) {
 //
 #[instrument]
 async fn capacity(mut client: Client<String>) {
-    println!("Initializing servers");
-    let mut servers = vec![];
-    for _ in 0..2*num_cpus::get() {
-        let address = client.add_address();
-        println!("  - Added address: {}", address);
-        servers.push(spawn_server(address));
-        if let Some(server) = servers.last() {
-            // Any String will start the server...
-            server.send(Msg::Start).unwrap();
-            let secs = tokio::time::Duration::from_millis(2000);
-            tokio::time::sleep(secs).await;
-            debug!("    - The server WAS spawned!");
-        } else {
-            println!("    - The server was NOT spawned!");
-        };
-    };
     let benchmark_start = tokio::time::Instant::now();
-    let ftr = run_stream(&mut client);
-    ftr.await;
-    for s in servers.iter() {
-        s.send(Msg::Stop).unwrap();
-    }
+    run_stream(&mut client).await;
     println!(
         "Throughput: {:.1} request/s",
         1000000.0 * client.counted as f64 / benchmark_start.elapsed().as_micros() as f64
@@ -153,16 +139,31 @@ fn calibrate_limit(c: &mut Criterion) {
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
     let mut client = Client::<String>::new();
-    client.count = 50_000;
+    let mut servers = vec![];
+    println!("Initializing servers");
+    for _ in 0..client.nservers {
+        let address = client.add_address();
+        println!("  - Added address: {}", address);
+        servers.push(spawn_server(address));
+        if let Some(server) = servers.last() {
+            // Any String will start the server...
+            server.send(Msg::Start).unwrap();
+            let secs = std::time::Duration::from_millis(2000);
+            std::thread::sleep(secs);
+            debug!("    - The server WAS spawned!");
+        } else {
+            debug!("    - The server was NOT spawned!");
+        };
+    }
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(8)
+        .worker_threads(4)
         .thread_name("calibrate-limit")
         .thread_stack_size(4 * 1024 * 1024)
         .build()
         .unwrap();
     group.bench_with_input(
-        BenchmarkId::new("calibrate-limit", client.count),
+        BenchmarkId::new("calibrate-limit", client.nrequests),
         &client,
         |b, c| {
             // Insert a call to `to_async` to convert the bencher to async mode.
@@ -170,6 +171,10 @@ fn calibrate_limit(c: &mut Criterion) {
             b.to_async(&tokio_executor).iter(|| capacity(c.clone()));
         },
     );
+    println!("Terminating servers");
+    for s in servers.iter() {
+        s.send(Msg::Stop).unwrap();
+    }
     group.finish();
 }
 
@@ -188,8 +193,14 @@ criterion_main!(benches);
 struct Client<T> {
     addresses: std::vec::Vec<T>,
     session: hyper::Client<hyper::client::HttpConnector>,
+    concurrency: usize,
     count: usize,
     counted: usize,
+    nclients: usize,
+    nservers: usize,
+    nstreams: usize,
+    niterations: usize,
+    nrequests: usize,
 }
 
 impl Client<String> {
@@ -210,11 +221,20 @@ impl Client<String> {
 
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
+        let cpus = num_cpus::get();
+        let streams = 50_000;
+        let iterations = 100;
         Client {
             addresses: vec![],
             session: hyper::Client::new(),
+            concurrency: 2_500,
             count: 1,
             counted: 0,
+            nclients: 2*cpus,
+            nservers: cpus,
+            nstreams: streams,
+            niterations: iterations,
+            nrequests: cpus * streams,
         }
     }
 }
@@ -263,7 +283,7 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
                     debug!("    - The server should start.");
                     init_mio_server(address.clone());
                     debug!("      - The server has started.");
-                },
+                }
                 Msg::Stop => {
                     debug!("    - The server should stop.");
                     return;
