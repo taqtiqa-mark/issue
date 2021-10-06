@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::StreamExt;
 use lazy_static::lazy_static; // 1.4.0
 use pprof::criterion::{Output, PProfProfiler};
@@ -202,11 +202,108 @@ fn calibrate_limit(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(3, Output::Protobuf));
+    config = alternate_config();
     targets = calibrate_limit
 }
 
 criterion_main!(benches);
+
+fn alternate_config() -> Criterion {
+    Criterion::default().with_measurement(RequestsPerSecond);
+    Criterion::default().with_profiler(PProfProfiler::new(3, Output::Protobuf))
+}
+
+/// Silly "measurement" that is really just wall-clock time reported in half-seconds.
+pub const NANOS_PER_SEC: u64 = 1_000_000_000;
+struct RequestsPerSecond;
+impl criterion::measurement::Measurement for RequestsPerSecond {
+    type Intermediate = std::time::Instant;
+    type Value = std::time::Duration;
+
+    fn start(&self) -> Self::Intermediate {
+        std::time::Instant::now()
+    }
+    fn end(&self, i: Self::Intermediate) -> Self::Value {
+        i.elapsed()
+    }
+    fn add(&self, v1: &Self::Value, v2: &Self::Value) -> Self::Value {
+        *v1 + *v2
+    }
+    fn zero(&self) -> Self::Value {
+        std::time::Duration::from_secs(0)
+    }
+    fn to_f64(&self, val: &Self::Value) -> f64 {
+        let nanos = val.as_secs() * NANOS_PER_SEC + u64::from(val.subsec_nanos());
+        nanos as f64
+    }
+    fn formatter(&self) -> &dyn criterion::measurement::ValueFormatter {
+        &HalfSecFormatter
+    }
+}
+struct HalfSecFormatter;
+impl criterion::measurement::ValueFormatter for HalfSecFormatter {
+    fn format_value(&self, value: f64) -> String {
+        // The value will be in nanoseconds so we have to convert to half-seconds.
+        format!("{} s/2", value * 2f64 * 10f64.powi(-9))
+    }
+
+    fn format_throughput(&self, throughput: &criterion::Throughput, value: f64) -> String {
+        match *throughput {
+            criterion::Throughput::Bytes(bytes) => format!(
+                "{} b/s/2",
+                bytes as f64 / (value * 2f64 * 10f64.powi(-9))
+            ),
+            criterion::Throughput::Elements(elems) => format!(
+                "{} elem/s/2",
+                elems as f64 / (value * 2f64 * 10f64.powi(-9))
+            ),
+            Throughput::Bytes(_) => todo!(),
+            Throughput::Elements(_) => todo!(),
+        }
+    }
+
+    fn scale_values(&self, ns: f64, values: &mut [f64]) -> &'static str {
+        for val in values {
+            *val *= 2f64 * 10f64.powi(-9);
+        }
+
+        "s/2"
+    }
+
+    fn scale_throughputs(
+        &self,
+        _typical: f64,
+        throughput: &Throughput,
+        values: &mut [f64],
+    ) -> &'static str {
+        match *throughput {
+            Throughput::Bytes(bytes) => {
+                // Convert nanoseconds/iteration to bytes/half-second.
+                for val in values {
+                    *val = (bytes as f64) / (*val * 2f64 * 10f64.powi(-9))
+                }
+
+                "b/s/2"
+            }
+            Throughput::Elements(elems) => {
+                for val in values {
+                    *val = (elems as f64) / (*val * 2f64 * 10f64.powi(-9))
+                }
+
+                "elem/s/2"
+            }
+        }
+    }
+
+    fn scale_for_machines(&self, values: &mut [f64]) -> &'static str {
+        // Convert values in nanoseconds to half-seconds.
+        for val in values {
+            *val *= 2f64 * 10f64.powi(-9);
+        }
+
+        "s/2"
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Code
