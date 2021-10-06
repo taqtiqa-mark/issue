@@ -17,6 +17,28 @@ use tracing::{self, debug};
 /// 188-305 Server Code
 ///
 
+impl<T: 'static> Default for Client<T> {
+    fn default() -> Self {
+        let cpus = num_cpus::get();
+        let clients = 2*cpus;
+        let streams = 100_000/clients;
+        let iterations = 100;
+        Client {
+            addresses: vec![],
+            session: hyper::Client::new(),
+            concurrency: 200,
+            count: 1,
+            counted: 0,
+            duration: std::time::Duration::new(0,0),
+            nclients: clients,
+            nservers: cpus,
+            nstreams: streams,
+            niterations: iterations,
+            nrequests: clients * streams,
+        }
+    }
+}
+
 /// Setup Streams for HTTP GET
 ///
 /// Invoke client to get URL, return a stream of response durations.
@@ -29,7 +51,7 @@ use tracing::{self, debug};
 #[instrument]
 fn make_stream<'client>(
     client: &'client mut Client<String>,
-) -> impl futures::Stream<Item = tokio::time::Duration> + 'client {
+) -> impl futures::Stream<Item = Client<String>> + 'client {
 
     let concurrency = client.concurrency;
 
@@ -55,7 +77,8 @@ fn make_stream<'client>(
             //let mut response = session.get("/").await.expect("Surf response");
             //let body = response.body_string().await.expect("Surf body");
             debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
-            yield futures::future::ready(query_start.elapsed());
+            client.duration = query_start.elapsed();
+            yield futures::future::ready(client.clone());
         }
     };
     stream.buffer_unordered(concurrency)
@@ -63,47 +86,46 @@ fn make_stream<'client>(
 
 #[instrument]
 async fn run_stream<'client>(client: &'client mut Client<String>) {
-    // {
     let mut counted = 0;
     let default = client.clone();
-    let mut clients = vec![default.clone(); client.nclients];
-    //let it = clients.into_iter();
-    // let it = clients.iter_mut();
+    let clients = vec![default.clone(); client.nclients];
+    let clients = &mut clients.clone();
     for i in 0..clients.len() {
-        // let local = tokio::task::LocalSet::new();
-        let mut client = clients[i].clone();
-        // local
-        // .run_until(async move {
-        // tokio::task::spawn_local(async move {
-        let sub_total = tokio::task::spawn(async move {
-            debug!("About to make stream");
-            let stream = make_stream(&mut client);
-            futures_util::pin_mut!(stream);
-            while let Some(_duration) = stream.next().await {
-                debug!("Stream next polled.");
-                counted += 1;
-            }
-            // let mut track = *client;
-            //client.counted = counted;
-            counted
-        })
-        .await
-        .expect("Client task");
-        clients[i].counted += sub_total;
-        debug!(
-            "Total client requests: {} Cummulative: {:?}",
-            sub_total, clients[i]
-        )
-
-        // })
-        // .await;
-        // }
+        let client = &clients[i];
+        let local = tokio::task::LocalSet::new();
+        let result = local
+            .run_until(async move {
+                let client = client.clone();
+                let mut result = client.clone();
+                let subtotal = tokio::task::spawn_local(async move {
+                // let sub_total = tokio::task::spawn(async move {
+                    debug!("About to make stream");
+                    let mut client = client.clone();
+                    let stream = make_stream(&mut client);
+                    futures_util::pin_mut!(stream);
+                    while let Some(client) = stream.next().await {
+                        debug!("Stream next polled.");
+                        counted += 1;
+                    }
+                    counted
+                })
+                .await
+                .expect("Client task");
+                result.counted += subtotal;
+                debug!(
+                "Total client requests: {} Cummulative: {:?}",
+                result.nrequests, result.counted
+                );
+                result
+            })
+            .await;
+        clients[i] = result;
     }
     let mut total = 0;
     let it = clients.into_iter();
     for client in it {
         total += client.counted;
-        println!("Cummulative Total: {}", total);
+        debug!("Cummulative Total: {}", total);
     }
     client.counted = total;
 }
@@ -157,9 +179,9 @@ fn calibrate_limit(c: &mut Criterion) {
     }
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(4)
+        .worker_threads(220)
         .thread_name("calibrate-limit")
-        .thread_stack_size(4 * 1024 * 1024)
+        .thread_stack_size(1 * 1024 * 1024)
         .build()
         .unwrap();
     group.bench_with_input(
@@ -196,6 +218,7 @@ struct Client<T> {
     concurrency: usize,
     count: usize,
     counted: usize,
+    duration: std::time::Duration,
     nclients: usize,
     nservers: usize,
     nstreams: usize,
@@ -216,26 +239,6 @@ impl Client<String> {
         debug!("Added address: {}", address);
         self.addresses.push(url.clone());
         url
-    }
-}
-
-impl<T: 'static> Default for Client<T> {
-    fn default() -> Self {
-        let cpus = num_cpus::get();
-        let streams = 50_000;
-        let iterations = 100;
-        Client {
-            addresses: vec![],
-            session: hyper::Client::new(),
-            concurrency: 2_500,
-            count: 1,
-            counted: 0,
-            nclients: 2*cpus,
-            nservers: cpus,
-            nstreams: streams,
-            niterations: iterations,
-            nrequests: cpus * streams,
-        }
     }
 }
 
