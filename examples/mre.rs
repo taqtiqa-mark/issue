@@ -1,7 +1,7 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+// use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::StreamExt;
 use lazy_static::lazy_static; // 1.4.0
-use pprof::criterion::{Output, PProfProfiler};
+// use pprof::criterion::{Output, PProfProfiler};
 use std::io::{Read, Write};
 use std::sync::Mutex;
 use tracing::instrument;
@@ -19,10 +19,11 @@ use tracing::{self, debug};
 
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
-        let cpus = num_cpus::get();
-        let clients = 2*cpus;
-        let streams = 100_000/clients;
-        let iterations = 100;
+        let requests = 300_000;
+        let cpus = num_cpus::get(); // Server tasks to start
+        let clients = 2*cpus;       // Client tasks to start
+        let streamed = requests/clients; // Requests per stream
+        let iterations = 100;       // Criteron samples
         Client {
             addresses: vec![],
             session: hyper::Client::new(),
@@ -32,9 +33,9 @@ impl<T: 'static> Default for Client<T> {
             duration: std::time::Duration::new(0,0),
             nclients: clients,
             nservers: cpus,
-            nstreams: streams,
+            nstreamed: streamed,
             niterations: iterations,
-            nrequests: clients * streams,
+            nrequests: clients * streamed,
         }
     }
 }
@@ -56,9 +57,9 @@ fn make_stream<'client>(
 
     let stream = async_stream::stream! {
         // Allocate each stream to one of the servers started
-        let it = client.addresses.iter().cycle().take(client.nstreams).cloned();
+        let it = client.addresses.iter().cycle().take(client.nstreamed).cloned();
         let vec = it.collect::<Vec<String>>();
-        let urls = vec!["http://".to_owned(); client.nstreams];
+        let urls = vec!["http://".to_owned(); client.nstreamed];
         let urls = urls.into_iter()
                         .zip(vec)
                         .map(|(s,t)|s+&t)
@@ -82,8 +83,6 @@ fn make_stream<'client>(
     };
     stream.buffer_unordered(concurrency)
 }
-
-enum Counter { }
 
 #[instrument]
 async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
@@ -115,32 +114,24 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
 #[instrument]
 async fn capacity(mut client: std::sync::Arc<Client<String>>) {
     let benchmark_start = tokio::time::Instant::now();
-    let t1 = run_stream(client.clone() );
-    let t2 = run_stream(client.clone() );
+    let t1 = run_stream(client.clone());
+    let t2 = run_stream(client.clone());
     t1.await;
     t2.await;
     let elapsed = benchmark_start.elapsed().as_micros() as f64;
     println!(
         "Throughput: {:.1} request/s [{} in {}]",
-        1000000.0 * client.nrequests as f64 / elapsed,
+        1000000.0 * 2. * client.nrequests as f64 / elapsed,
         client.counted, elapsed
     );
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Criterion Setup
-//
-// The hang behavior is intermittent.
-// We use Criterion to run 100 iterations which should be sufficient to
-// generate at least one hang across different users/machines.
-//
-fn calibrate_limit(c: &mut Criterion<RequestsPerSecond>) {
+fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .try_init()
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
-    let mut group = c.benchmark_group("Calibrate");
     let mut client = Client::<String>::new();
     let nrequests = client.nrequests;
     let mut servers = vec![];
@@ -150,7 +141,6 @@ fn calibrate_limit(c: &mut Criterion<RequestsPerSecond>) {
         println!("  - Added address: {}", address);
         servers.push(spawn_server(address));
         if let Some(server) = servers.last() {
-            // Any String will start the server...
             server.send(Msg::Start).unwrap();
             let secs = std::time::Duration::from_millis(2000);
             std::thread::sleep(secs);
@@ -167,126 +157,12 @@ fn calibrate_limit(c: &mut Criterion<RequestsPerSecond>) {
         .thread_stack_size(1 * 1024 * 1024)
         .build()
         .unwrap();
-    group.bench_with_input(
-        BenchmarkId::new("calibrate-limit", nrequests),
-        &client.clone(),
-        |b, c| {
-            // Insert a call to `to_async` to convert the bencher to async mode.
-            // The timing loops are the same as with the normal bencher.
-            b.to_async(&tokio_executor).iter(|| capacity(client.clone()));
-        },
-    );
+    tokio_executor.block_on(async {
+        capacity(client.clone()).await
+    });
     println!("Terminating servers");
     for s in servers.iter() {
         s.send(Msg::Stop).unwrap();
-    }
-    group.finish();
-}
-
-criterion_group! {
-    name = benches;
-    config = alternate_config();
-    targets = calibrate_limit
-}
-
-criterion_main!(benches);
-
-fn alternate_config() -> Criterion<RequestsPerSecond> {
-    Criterion::default()
-        .with_profiler(PProfProfiler::new(3, Output::Protobuf))
-        .with_measurement(RequestsPerSecond)
-
-}
-
-/// Silly "measurement" that is really just wall-clock time reported in half-seconds.
-pub const NANOS_PER_SEC: u64 = 1_000_000_000;
-struct RequestsPerSecond;
-impl criterion::measurement::Measurement for RequestsPerSecond {
-    type Intermediate = std::time::Instant;
-    type Value = std::time::Duration;
-
-    fn start(&self) -> Self::Intermediate {
-        std::time::Instant::now()
-    }
-    fn end(&self, i: Self::Intermediate) -> Self::Value {
-        i.elapsed()
-    }
-    fn add(&self, v1: &Self::Value, v2: &Self::Value) -> Self::Value {
-        *v1 + *v2
-    }
-    fn zero(&self) -> Self::Value {
-        std::time::Duration::from_secs(0)
-    }
-    fn to_f64(&self, val: &Self::Value) -> f64 {
-        let nanos = val.as_secs() * NANOS_PER_SEC + u64::from(val.subsec_nanos());
-        nanos as f64
-    }
-    fn formatter(&self) -> &dyn criterion::measurement::ValueFormatter {
-        &HalfSecFormatter
-    }
-}
-struct HalfSecFormatter;
-impl criterion::measurement::ValueFormatter for HalfSecFormatter {
-    fn format_value(&self, value: f64) -> String {
-        // The value will be in nanoseconds so we have to convert to half-seconds.
-        format!("{} s/2", value * 2f64 * 10f64.powi(-9))
-    }
-
-    fn format_throughput(&self, throughput: &criterion::Throughput, value: f64) -> String {
-        match *throughput {
-            criterion::Throughput::Bytes(bytes) => format!(
-                "{} b/s/2",
-                bytes as f64 / (value * 2f64 * 10f64.powi(-9))
-            ),
-            criterion::Throughput::Elements(elems) => format!(
-                "{} elem/s/2",
-                elems as f64 / (value * 2f64 * 10f64.powi(-9))
-            ),
-            Throughput::Bytes(_) => todo!(),
-            Throughput::Elements(_) => todo!(),
-        }
-    }
-
-    fn scale_values(&self, ns: f64, values: &mut [f64]) -> &'static str {
-        for val in values {
-            *val *= 2f64 * 10f64.powi(-9);
-        }
-
-        "s/2"
-    }
-
-    fn scale_throughputs(
-        &self,
-        _typical: f64,
-        throughput: &Throughput,
-        values: &mut [f64],
-    ) -> &'static str {
-        match *throughput {
-            Throughput::Bytes(bytes) => {
-                // Convert nanoseconds/iteration to bytes/half-second.
-                for val in values {
-                    *val = (bytes as f64) / (*val * 2f64 * 10f64.powi(-9))
-                }
-
-                "b/s/2"
-            }
-            Throughput::Elements(elems) => {
-                for val in values {
-                    *val = (elems as f64) / (*val * 2f64 * 10f64.powi(-9))
-                }
-
-                "elem/s/2"
-            }
-        }
-    }
-
-    fn scale_for_machines(&self, values: &mut [f64]) -> &'static str {
-        // Convert values in nanoseconds to half-seconds.
-        for val in values {
-            *val *= 2f64 * 10f64.powi(-9);
-        }
-
-        "s/2"
     }
 }
 
@@ -303,7 +179,7 @@ struct Client<T> {
     duration: std::time::Duration,
     nclients: usize,
     nservers: usize,
-    nstreams: usize,
+    nstreamed: usize,
     niterations: usize,
     nrequests: usize,
 }
@@ -330,9 +206,6 @@ impl Client<String> {
 // This rules out anything Hyper server related.
 // This also means the example is self contained, hence reproducible
 //
-lazy_static! {
-    static ref ADDR_VEC: Mutex<Vec<String>> = Mutex::new(vec![]);
-}
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
 Connection: keep-alive
