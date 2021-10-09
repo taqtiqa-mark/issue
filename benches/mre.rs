@@ -26,7 +26,7 @@ impl<T: 'static> Default for Client<T> {
         Client {
             addresses: vec![],
             session: hyper::Client::new(),
-            concurrency: 200,
+            concurrency: 100,
             count: 1,
             counted: 0,
             duration: std::time::Duration::new(0,0),
@@ -47,11 +47,10 @@ impl<T: 'static> Default for Client<T> {
 ///
 /// For a detailed description of this setup, see:
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
-
 #[instrument]
 fn make_stream<'client>(
-    client: &'client mut Client<String>,
-) -> impl futures::Stream<Item = Client<String>> + 'client {
+    client: &'client Client<String>,
+) -> impl futures::Stream<Item = usize> + 'client {
 
     let concurrency = client.concurrency;
 
@@ -77,57 +76,34 @@ fn make_stream<'client>(
             //let mut response = session.get("/").await.expect("Surf response");
             //let body = response.body_string().await.expect("Surf body");
             debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
-            client.duration = query_start.elapsed();
-            yield futures::future::ready(client.clone());
+
+            yield futures::future::ready(1);
         }
     };
     stream.buffer_unordered(concurrency)
 }
 
+enum Counter { }
+
 #[instrument]
-async fn run_stream<'client>(client: &'client mut Client<String>) {
-    let mut counted = 0;
-    let default = client.clone();
-    let clients = vec![default.clone(); client.nclients];
-    let clients = &mut clients.clone();
-    for i in 0..clients.len() {
-        let client = &clients[i];
-        let local = tokio::task::LocalSet::new();
-        let result = local
-            .run_until(async move {
-                let client = client.clone();
-                let mut result = client.clone();
-                let subtotal = tokio::task::spawn_local(async move {
-                // let sub_total = tokio::task::spawn(async move {
-                    debug!("About to make stream");
-                    let mut client = client.clone();
-                    let stream = make_stream(&mut client);
-                    futures_util::pin_mut!(stream);
-                    while let Some(client) = stream.next().await {
-                        debug!("Stream next polled.");
-                        counted += 1;
-                    }
-                    counted
-                })
-                .await
-                .expect("Client task");
-                result.counted += subtotal;
-                debug!(
-                "Total client requests: {} Cummulative: {:?}",
-                result.nrequests, result.counted
-                );
-                result
-            })
-            .await;
-        clients[i] = result;
+async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
+    println!("Run Stream. Thread: {:?}", std::thread::current().id());
+    let task = tokio::spawn(async move {
+    let client = client.as_ref();
+    let stream =  make_stream(client);
+    let mut counted =0;
+    futures_util::pin_mut!(stream);
+    let concurrency = 100;
+    while let Some(client) = stream.next().await {
+        counted += 1;
+        debug!("Stream next polled. Thread: {:?}", std::thread::current().id());
     }
-    let mut total = 0;
-    let it = clients.into_iter();
-    for client in it {
-        total += client.counted;
-        debug!("Cummulative Total: {}", total);
-    }
-    client.counted = total;
+    debug!(
+        "Total client requests: {} Cummulative: {:?}",
+        0, counted
+    );
+    });
+    task.await;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -137,12 +113,17 @@ async fn run_stream<'client>(client: &'client mut Client<String>) {
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 //
 #[instrument]
-async fn capacity(mut client: Client<String>) {
+async fn capacity(mut client: std::sync::Arc<Client<String>>) {
     let benchmark_start = tokio::time::Instant::now();
-    run_stream(&mut client).await;
+    let t1 = run_stream(client.clone() );
+    let t2 = run_stream(client.clone() );
+    t1.await;
+    t2.await;
+    let elapsed = benchmark_start.elapsed().as_micros() as f64;
     println!(
-        "Throughput: {:.1} request/s",
-        1000000.0 * client.counted as f64 / benchmark_start.elapsed().as_micros() as f64
+        "Throughput: {:.1} request/s [{} in {}]",
+        1000000.0 * client.nrequests as f64 / elapsed,
+        client.counted, elapsed
     );
 }
 
@@ -153,7 +134,7 @@ async fn capacity(mut client: Client<String>) {
 // We use Criterion to run 100 iterations which should be sufficient to
 // generate at least one hang across different users/machines.
 //
-fn calibrate_limit(c: &mut Criterion) {
+fn calibrate_limit(c: &mut Criterion<RequestsPerSecond>) {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .try_init()
@@ -161,6 +142,7 @@ fn calibrate_limit(c: &mut Criterion) {
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut group = c.benchmark_group("Calibrate");
     let mut client = Client::<String>::new();
+    let nrequests = client.nrequests;
     let mut servers = vec![];
     println!("Initializing servers");
     for _ in 0..client.nservers {
@@ -177,20 +159,21 @@ fn calibrate_limit(c: &mut Criterion) {
             debug!("    - The server was NOT spawned!");
         };
     }
+    let client = std::sync::Arc::new(client);
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(220)
+        .worker_threads(10)
         .thread_name("calibrate-limit")
         .thread_stack_size(1 * 1024 * 1024)
         .build()
         .unwrap();
     group.bench_with_input(
-        BenchmarkId::new("calibrate-limit", client.nrequests),
-        &client,
+        BenchmarkId::new("calibrate-limit", nrequests),
+        &client.clone(),
         |b, c| {
             // Insert a call to `to_async` to convert the bencher to async mode.
             // The timing loops are the same as with the normal bencher.
-            b.to_async(&tokio_executor).iter(|| capacity(c.clone()));
+            b.to_async(&tokio_executor).iter(|| capacity(client.clone()));
         },
     );
     println!("Terminating servers");
@@ -208,9 +191,11 @@ criterion_group! {
 
 criterion_main!(benches);
 
-fn alternate_config() -> Criterion {
-    Criterion::default().with_measurement(RequestsPerSecond);
-    Criterion::default().with_profiler(PProfProfiler::new(3, Output::Protobuf))
+fn alternate_config() -> Criterion<RequestsPerSecond> {
+    Criterion::default()
+        .with_profiler(PProfProfiler::new(3, Output::Protobuf))
+        .with_measurement(RequestsPerSecond)
+
 }
 
 /// Silly "measurement" that is really just wall-clock time reported in half-seconds.
