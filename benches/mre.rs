@@ -19,7 +19,7 @@ use tracing::{self, debug};
 
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
-        let requests = 100_000;
+        let requests = 1_000;
         let cpus = num_cpus::get(); // Server tasks to start
         let clients = cpus*50;         // Client tasks to start
         let servers = cpus*50;
@@ -90,7 +90,7 @@ enum Counter { }
 #[instrument]
 async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
     println!("Run Stream. Thread: {:?}", std::thread::current().id());
-    // let task = tokio::spawn(async move {
+    let task = tokio::spawn(async move {
     let client = client.as_ref();
     let stream =  make_stream(client);
     let mut counted =0;
@@ -104,8 +104,8 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
         "Total client requests: {} Cummulative: {:?}",
         0, counted
     )
-    // });
-    // task.await;
+    });
+    task.await;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -116,17 +116,17 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
 //
 #[instrument]
 async fn capacity(mut client: std::sync::Arc<Client<String>>) {
-    let benchmark_start = tokio::time::Instant::now();
-    let t1 = tokio::spawn(run_stream(client.clone() ));
-    let t2 = tokio::spawn(run_stream(client.clone() ));
+    // let benchmark_start = tokio::time::Instant::now();
+    let t1 = run_stream(client.clone() );
+    let t2 = run_stream(client.clone() );
     t1.await;
     t2.await;
-    let elapsed = benchmark_start.elapsed().as_micros() as f64;
-    println!(
-        "Throughput: {:.1} request/s [{} in {}]",
-        1000000.0 * client.nrequests as f64 / elapsed,
-        client.nrequests, elapsed
-    );
+    // let elapsed = benchmark_start.elapsed().as_micros() as f64;
+    // debug!(
+    //     "Throughput: {:.1} request/s [{} in {}]",
+    //     1000000.0 * client.nrequests as f64 / elapsed,
+    //     client.nrequests, elapsed
+    // );
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -154,13 +154,13 @@ fn calibrate_limit(c: &mut Criterion<RequestsPerSecond>) {
         if let Some(server) = servers.last() {
             // Any String will start the server...
             server.send(Msg::Start).unwrap();
-            let secs = std::time::Duration::from_millis(2000);
-            std::thread::sleep(secs);
             debug!("    - The server WAS spawned!");
         } else {
             debug!("    - The server was NOT spawned!");
         };
     }
+    let secs = std::time::Duration::from_millis(2000);
+    std::thread::sleep(secs);
     let client = std::sync::Arc::new(client);
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -169,8 +169,9 @@ fn calibrate_limit(c: &mut Criterion<RequestsPerSecond>) {
         .thread_stack_size(1 * 1024 * 1024)
         .build()
         .unwrap();
-    group.bench_with_input(
-        BenchmarkId::new("calibrate-limit", nrequests),
+    group.throughput(Throughput::Elements(client.nrequests as u64))
+        .bench_with_input(
+        BenchmarkId::new("calibrate-limit", client.nrequests),
         &client.clone(),
         |b, c| {
             // Insert a call to `to_async` to convert the bencher to async mode.
@@ -197,10 +198,11 @@ fn alternate_config() -> Criterion<RequestsPerSecond> {
     Criterion::default()
         .with_profiler(PProfProfiler::new(3, Output::Protobuf))
         .with_measurement(RequestsPerSecond)
-
+        .nresamples(2)
+        .sample_size(10)
 }
 
-/// Silly "measurement" that is really just wall-clock time reported in half-seconds.
+/// Silly "measurement" that is really just wall-clock time reported in seconds.
 pub const NANOS_PER_SEC: u64 = 1_000_000_000;
 struct RequestsPerSecond;
 impl criterion::measurement::Measurement for RequestsPerSecond {
@@ -224,37 +226,37 @@ impl criterion::measurement::Measurement for RequestsPerSecond {
         nanos as f64
     }
     fn formatter(&self) -> &dyn criterion::measurement::ValueFormatter {
-        &HalfSecFormatter
+        &RequestsPerSecondFormatter
     }
 }
-struct HalfSecFormatter;
-impl criterion::measurement::ValueFormatter for HalfSecFormatter {
+struct RequestsPerSecondFormatter;
+impl criterion::measurement::ValueFormatter for RequestsPerSecondFormatter {
     fn format_value(&self, value: f64) -> String {
-        // The value will be in nanoseconds so we have to convert to half-seconds.
-        format!("{} s/2", value * 2f64 * 10f64.powi(-9))
+        // The value will be in nanoseconds so we have to convert to seconds.
+        format!("{} s", value * 10f64.powi(-9))
     }
 
     fn format_throughput(&self, throughput: &criterion::Throughput, value: f64) -> String {
         match *throughput {
             criterion::Throughput::Bytes(bytes) => format!(
-                "{} b/s/2",
-                bytes as f64 / (value * 2f64 * 10f64.powi(-9))
+                "{} b/sec",
+                bytes as f64 / (value * 10f64.powi(-9))
             ),
             criterion::Throughput::Elements(elems) => format!(
-                "{} elem/s/2",
-                elems as f64 / (value * 2f64 * 10f64.powi(-9))
+                "{} req/sec",
+                elems as f64 / (value * 10f64.powi(-9))
             ),
-            Throughput::Bytes(_) => todo!(),
-            Throughput::Elements(_) => todo!(),
+            criterion::Throughput::Bytes(_) => todo!(),
+            criterion::Throughput::Elements(_) => todo!(),
         }
     }
 
     fn scale_values(&self, ns: f64, values: &mut [f64]) -> &'static str {
         for val in values {
-            *val *= 2f64 * 10f64.powi(-9);
+            *val *= 10f64.powi(-9);
         }
 
-        "s/2"
+        "sec"
     }
 
     fn scale_throughputs(
@@ -265,30 +267,30 @@ impl criterion::measurement::ValueFormatter for HalfSecFormatter {
     ) -> &'static str {
         match *throughput {
             Throughput::Bytes(bytes) => {
-                // Convert nanoseconds/iteration to bytes/half-second.
+                // Convert nanoseconds/iteration to bytes/second.
                 for val in values {
-                    *val = (bytes as f64) / (*val * 2f64 * 10f64.powi(-9))
+                    *val = (bytes as f64) / (*val * 10f64.powi(-9))
                 }
 
-                "b/s/2"
+                "b/sec"
             }
             Throughput::Elements(elems) => {
                 for val in values {
-                    *val = (elems as f64) / (*val * 2f64 * 10f64.powi(-9))
+                    *val = (elems as f64) / (*val * 10f64.powi(-9))
                 }
 
-                "elem/s/2"
+                "req/sec"
             }
         }
     }
 
     fn scale_for_machines(&self, values: &mut [f64]) -> &'static str {
-        // Convert values in nanoseconds to half-seconds.
+        // Convert values in nanoseconds to seconds.
         for val in values {
-            *val *= 2f64 * 10f64.powi(-9);
+            *val *= 10f64.powi(-9);
         }
 
-        "s/2"
+        "sec"
     }
 }
 
