@@ -19,20 +19,21 @@ use tracing::{self, debug};
 
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
-        let requests = 300_000;
+        let requests = 100_000;
         let cpus = num_cpus::get(); // Server tasks to start
-        let clients = 2*cpus;       // Client tasks to start
+        let clients = cpus*50;         // Client tasks to start
+        let servers = cpus*50;
         let streamed = requests/clients; // Requests per stream
         let iterations = 100;       // Criteron samples
         Client {
             addresses: vec![],
             session: hyper::Client::new(),
-            concurrency: 100,
+            concurrency: 80,
             count: 1,
             counted: 0,
             duration: std::time::Duration::new(0,0),
             nclients: clients,
-            nservers: cpus,
+            nservers: servers,
             nstreamed: streamed,
             niterations: iterations,
             nrequests: clients * streamed,
@@ -52,8 +53,6 @@ impl<T: 'static> Default for Client<T> {
 fn make_stream<'client>(
     client: &'client Client<String>,
 ) -> impl futures::Stream<Item = usize> + 'client {
-
-    let concurrency = client.concurrency;
 
     let stream = async_stream::stream! {
         // Allocate each stream to one of the servers started
@@ -81,28 +80,28 @@ fn make_stream<'client>(
             yield futures::future::ready(1);
         }
     };
-    stream.buffer_unordered(concurrency)
+    stream.buffer_unordered(client.concurrency)
 }
 
 #[instrument]
 async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
-    println!("Run Stream. Thread: {:?}", std::thread::current().id());
-    let task = tokio::spawn(async move {
-    let client = client.as_ref();
-    let stream =  make_stream(client);
-    let mut counted =0;
-    futures_util::pin_mut!(stream);
-    let concurrency = 100;
-    while let Some(client) = stream.next().await {
-        counted += 1;
-        debug!("Stream next polled. Thread: {:?}", std::thread::current().id());
-    }
-    debug!(
-        "Total client requests: {} Cummulative: {:?}",
-        0, counted
-    );
-    });
-    task.await;
+    // let task = tokio::spawn(async move {
+        println!("Run Stream. Thread: {:?}", std::thread::current().id());
+        let client = client.as_ref();
+        let stream =  make_stream(client);
+        let mut counted =0;
+        futures_util::pin_mut!(stream);
+        while let Some(_client) = stream.next().await {
+            counted += 1;
+            debug!("Stream next polled. Thread: {:?}", std::thread::current().id());
+        }
+        debug!(
+            "Total client requests: {} Cumulative: {:?}",
+            0, counted
+        );
+    // });
+    // Make Clippy quiet about async returning async: await now.
+    // task.await.expect("Stream, or ConcurrentIterator")
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -113,22 +112,74 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
 //
 #[instrument]
 async fn capacity(mut client: std::sync::Arc<Client<String>>) {
+    let mut clients = vec![client.clone();client.nclients];
+    let mut handles = vec![];
+    let parallel_requests = 10;
+    for c in clients.into_iter() {
+        handles.push(tokio::spawn(run_stream(c)))
+    }
     let benchmark_start = tokio::time::Instant::now();
-    let t1 = run_stream(client.clone());
-    let t2 = run_stream(client.clone());
-    t1.await;
-    t2.await;
+    println!("Awaiting clients");
+    // for h in handles.into_iter() {
+    //     println!("Awaiting Tokio task");
+    //     h.await.expect("")
+    // }
+    let results = futures::future::join_all(handles).await;
+    //The FuturesUnordered is slower than join_all
+    // let mut handles = clients.into_iter()
+    //     .map(|c| tokio::spawn(run_stream(c)))
+    //     .collect::<futures::stream::FuturesUnordered<_>>();
+    // while let Some(res) = handles.next().await { }
+    // // Buffering does not seem to work.
+    // // let mut pf = futures::stream::iter(clients)
+    // //     .map(|c| {
+    // //         // let client = client.clone();
+    // //         tokio::spawn(run_stream(c))
+    // //     })
+    // //     .buffer_unordered(parallel_requests);
+    // // let mut counted = 0;
+    // //
+    // // This `while let`is very slow.
+    // //
+    // // while let parallel_result = pf.next() {
+    // //     parallel_result.await;
+    // //     counted += 1;
+    // //     debug!("Parallel client polled. Thread: {:?}", std::thread::current().id());
+    // // }
+    // // This is faster than `while let`
+    // // pf
+    // //     .for_each(|b| async {
+    // //         match b {
+    // //             Ok(()) => println!("Parallel stream completed"),
+    // //             Err(e) => eprintln!("Got a tokio::JoinError: {}", e),
+    // //         }
+    // //     })
+    // //     .await;
+    // //
+    // Additional spawn allows for parallel running of streams.
+    // let t1 = tokio::spawn(run_stream(client.clone()));
+    // let t2 = tokio::spawn(run_stream(client.clone()));
+    // let t3 = tokio::spawn(run_stream(client.clone()));
+    // let t4 = tokio::spawn(run_stream(client.clone()));
+    // let t5 = tokio::spawn(run_stream(client.clone()));
+    // let t6 = tokio::spawn(run_stream(client.clone()));
+    // t1.await.expect("Parallel stream 1");
+    // t2.await.expect("Parallel stream 2");
+    // t3.await.expect("Parallel stream 3");
+    // t4.await.expect("Parallel stream 4");
+    // t5.await.expect("Parallel stream 5");
+    // t6.await.expect("Parallel stream 6");
     let elapsed = benchmark_start.elapsed().as_micros() as f64;
     println!(
         "Throughput: {:.1} request/s [{} in {}]",
         1000000.0 * 2. * client.nrequests as f64 / elapsed,
-        client.counted, elapsed
+        client.nrequests, elapsed
     );
 }
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::TRACE)
         .try_init()
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
@@ -142,19 +193,19 @@ fn main() {
         servers.push(spawn_server(address));
         if let Some(server) = servers.last() {
             server.send(Msg::Start).unwrap();
-            let secs = std::time::Duration::from_millis(2000);
-            std::thread::sleep(secs);
             debug!("    - The server WAS spawned!");
         } else {
             debug!("    - The server was NOT spawned!");
         };
     }
+    let secs = std::time::Duration::from_millis(2000);
+    std::thread::sleep(secs);
     let client = std::sync::Arc::new(client);
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(10)
+        .worker_threads(120)
         .thread_name("calibrate-limit")
-        .thread_stack_size(1 * 1024 * 1024)
+        .thread_stack_size(4 * 1024 * 1024)
         .build()
         .unwrap();
     tokio_executor.block_on(async {
