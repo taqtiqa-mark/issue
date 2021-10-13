@@ -19,22 +19,24 @@ use tracing::{self, debug};
 
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
-        let cpus = num_cpus::get();
-        let clients = 2*cpus;
-        let streams = 100_000/clients;
-        let iterations = 100;
+        let requests = 100_000;
+        let cpus = num_cpus::get(); // Server tasks to start
+        let clients = cpus*50;         // Client tasks to start
+        let servers = cpus*50;
+        let streamed = requests/clients; // Requests per stream
+        let iterations = 100;       // Criteron samples
         Client {
             addresses: vec![],
             session: hyper::Client::new(),
-            concurrency: 100,
+            concurrency: 80,
             count: 1,
             counted: 0,
             duration: std::time::Duration::new(0,0),
             nclients: clients,
-            nservers: cpus,
-            nstreams: streams,
+            nservers: servers,
+            nstreamed: streamed,
             niterations: iterations,
-            nrequests: clients * streams,
+            nrequests: clients * streamed,
         }
     }
 }
@@ -56,9 +58,9 @@ fn make_stream<'client>(
 
     let stream = async_stream::stream! {
         // Allocate each stream to one of the servers started
-        let it = client.addresses.iter().cycle().take(client.nstreams).cloned();
+        let it = client.addresses.iter().cycle().take(client.nstreamed).cloned();
         let vec = it.collect::<Vec<String>>();
-        let urls = vec!["http://".to_owned(); client.nstreams];
+        let urls = vec!["http://".to_owned(); client.nstreamed];
         let urls = urls.into_iter()
                         .zip(vec)
                         .map(|(s,t)|s+&t)
@@ -88,7 +90,7 @@ enum Counter { }
 #[instrument]
 async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
     println!("Run Stream. Thread: {:?}", std::thread::current().id());
-    let task = tokio::spawn(async move {
+    // let task = tokio::spawn(async move {
     let client = client.as_ref();
     let stream =  make_stream(client);
     let mut counted =0;
@@ -101,9 +103,9 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
     debug!(
         "Total client requests: {} Cummulative: {:?}",
         0, counted
-    );
-    });
-    task.await;
+    )
+    // });
+    // task.await;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -115,15 +117,15 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
 #[instrument]
 async fn capacity(mut client: std::sync::Arc<Client<String>>) {
     let benchmark_start = tokio::time::Instant::now();
-    let t1 = run_stream(client.clone() );
-    let t2 = run_stream(client.clone() );
+    let t1 = tokio::spawn(run_stream(client.clone() ));
+    let t2 = tokio::spawn(run_stream(client.clone() ));
     t1.await;
     t2.await;
     let elapsed = benchmark_start.elapsed().as_micros() as f64;
     println!(
         "Throughput: {:.1} request/s [{} in {}]",
         1000000.0 * client.nrequests as f64 / elapsed,
-        client.counted, elapsed
+        client.nrequests, elapsed
     );
 }
 
@@ -303,7 +305,7 @@ struct Client<T> {
     duration: std::time::Duration,
     nclients: usize,
     nservers: usize,
-    nstreams: usize,
+    nstreamed: usize,
     niterations: usize,
     nrequests: usize,
 }
