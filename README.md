@@ -7,11 +7,46 @@ Listening on address: `127.0.0.1:8888`
 RUST_LOG=trace cargo bench --bench mre -Z unstable-options --profile release -- calibrate-limit --nocapture &> bench-trace.log
 ```
 
-Flamegraph
+## Relaxing Network Constraints
+
+[Tips to increase TCP-IP connections (Linux)](https://stackoverflow.com/questions/410616/increasing-the-maximum-number-of-tcp-ip-connections-in-linux)
+
+How many socket connection per second can we guarantee?
+This the number of ports that can be created for one IP address
+(`tcp_fin_timeout`),divided by the minimum any socket is unusable after being
+used once (`tcp_fin_timeout`).
+Example:
+
+```bash
+$ sysctl net.ipv4.ip_local_port_range
+net.ipv4.ip_local_port_range = 32768    60999
+$ sysctl net.ipv4.tcp_fin_timeout
+net.ipv4.tcp_fin_timeout = 60
+```
+
+These values indicate this system cannot consistently guarantee more than
+(60999 - 32768) / 60 = 470 sockets per second.
+
+To upgrade:
+
+```bash
+sysctl net.ipv4.ip_local_port_range="15000 61000"
+sysctl net.ipv4.tcp_fin_timeout=15
+```
+
+[Rust parallel HTTP requests](https://stackoverflow.com/questions/51044467/how-can-i-perform-parallel-asynchronous-http-get-requests-with-reqwest)
+
+## Benchmark
+
+```bash
+cargo bench --bench mre -Z unstable-options --profile release -- calibrate-limit --nocapture
+```
+
+## Flamegraph
 
 ```bash
 echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
-cargo bench --bench mre -- calibrate-limit --nocapture --profile-time 130
+cargo bench --bench mre -- calibrate-limit --nocapture --profile-time 130 mre
 go tool pprof -http=:8080 ./target/criterion/Calibrate/calibrate-limit/100000/profile/profile.pb
 
 go tool pprof -svg profile300.gz ./../target/criterion/Calibrate/calibrate-limit/100000/profile/profile.pb

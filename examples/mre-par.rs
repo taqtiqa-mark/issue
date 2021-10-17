@@ -1,11 +1,13 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use futures::StreamExt;
-use lazy_static::lazy_static; // 1.4.0
-use pprof::criterion::{Output, PProfProfiler};
+// use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+// use pprof::criterion::{Output, PProfProfiler};
+// use futures::stream::futures_unordered;
+use futures::stream::StreamExt;
+// use lazy_static::lazy_static; // 1.4.0
+use par_stream::ParStreamExt;
 use std::io::{Read, Write};
-use std::sync::Mutex;
-use tracing::instrument;
+// use std::sync::Mutex;
 use tracing::{self, debug};
+use tracing::instrument;
 
 /// Table of Contents
 ///
@@ -19,48 +21,44 @@ use tracing::{self, debug};
 
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
-        let requests = 1_000_000;
+        let requests = 3_000_000;
         let cpus = num_cpus::get(); // Server tasks to start
-        let clients = cpus * 50; // Client tasks to start
-        let servers = cpus * 50;
-        let iterations = 100; // Criteron samples
+        let clients = cpus;       // Client tasks to start
+        let streamed = requests/clients; // Requests per stream
+        let iterations = 100;       // Criteron samples
         Client {
             addresses: vec![],
             session: hyper::Client::new(),
-            concurrency: 80,
+            concurrency: 100,
             count: 1,
             counted: 0,
-            duration: std::time::Duration::new(0, 0),
+            duration: std::time::Duration::new(0,0),
             nclients: clients,
-            nservers: servers,
-            nstreamed: requests / clients,
+            nservers: cpus,
+            nstreamed: streamed,
             niterations: iterations,
-            nrequests: requests,
+            nrequests: clients * streamed,
         }
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-///
-///  Client setup
-///
-
 /// Setup Streams for HTTP GET
 ///
-/// Allocate each iteration to one of the servers started - ensures a server is
-/// not a bottle neck.
 /// Invoke client to get URL, return a stream of response durations.
-/// Note: Does *not* spawn new threads.
-/// Requests are made concurrently (not parallel) by this part of the code.
-/// Async code runs on the caller thread, where parallelism is introduced.
+/// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
+/// Async code runs on the caller thread.
 ///
-/// For a description of this use of streams, see:
+/// For a detailed description of this setup, see:
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
 #[instrument]
 fn make_stream<'client>(
-    client: &'client Client<String>,
+    client: std::sync::Arc<Client<String>>,
 ) -> impl futures::Stream<Item = usize> + 'client {
+
+    let concurrency = client.concurrency;
+
     let stream = async_stream::stream! {
+        // Allocate each stream to one of the servers started
         let it = client.addresses.iter().cycle().take(client.nstreamed).cloned();
         let vec = it.collect::<Vec<String>>();
         let urls = vec!["http://".to_owned(); client.nstreamed];
@@ -73,8 +71,8 @@ fn make_stream<'client>(
                         .collect::<Vec<hyper::Uri>>();
         for url in urls.iter() {
             let query_start = tokio::time::Instant::now();
-            debug!("URL Parsed: {}",  url);
-            let mut response = client.session.get(url.clone()).await.expect("Hyper client response");
+            debug!("URL String: {} URL Parsed: {}", &url, url);
+            let mut response = client.session.get(url.clone()).await.expect("Hyper response");
             let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
             // let (parts, body) = response.into_parts();
             // This is for Surf client use case
@@ -85,20 +83,70 @@ fn make_stream<'client>(
             yield futures::future::ready(1);
         }
     };
-    stream.buffer_unordered(client.concurrency)
+    stream.buffer_unordered(concurrency)
 }
 
 #[instrument]
-async fn run_stream(client: std::sync::Arc<Client<String>>) -> () {
-    let client = client.as_ref();
-    let stream = make_stream(client);
-    futures_util::pin_mut!(stream);
-    while let Some(_client) = stream.next().await {
-        debug!(
-            "Stream next polled. Thread: {:?}",
-            std::thread::current().id()
-        );
-    }
+async fn run_stream_par<'client>(client: std::sync::Arc<Client<String>>) {
+    println!("Run Stream. Thread: {:?}", std::thread::current().id());
+    let mut counted =0;
+    // let sclient = client;
+    let it = client.addresses.iter().cycle().take(client.nstreamed).cloned();
+    let vec = it.collect::<Vec<String>>();
+    let urls = vec!["http://".to_owned(); client.nrequests];
+    let urls = urls.into_iter()
+                    .zip(vec)
+                    .map(|(s,t)|s+&t)
+                    .collect::<Vec<String>>();
+    let urls = urls.into_iter()
+                    .map(|u|u.parse::<hyper::Uri>().unwrap())
+                    .collect::<Vec<hyper::Uri>>();
+    let urls = std::sync::Arc::new(urls);
+    let scale = Box::new(2usize);
+    let addition = Box::new(1usize);
+    // stream.wrapping_enumerate();
+    let doubled = futures::stream::iter(0..client.nrequests)
+        // add indexes that does not panic on overflow
+        .wrapping_enumerate()
+        // unordered parallel tasks on futures
+        .par_then_unordered(None, move |(index, value)| {
+            // clone needed variables in the main thread
+            let client = client.clone();
+            let urls = urls.clone();
+            // the future is sent to a parallel worker
+            async move {
+                let urls = urls.clone();
+                let url: &hyper<Uri> = &urls[index];
+                let mut response = client.session.get(urls[index]).await.expect("Hyper response");
+                let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
+                (index,response)
+            }
+        })
+        // unordered parallel tasks on closures
+        .par_map_unordered(None, move |(index, value)| {
+            // cloned needed variables in the main thread
+            let cloned = *client;
+
+            // the future is sent to a parallel worker
+            move || (index, value )
+        })
+        // reorder the values back by indexes
+        //.reorder_enumerated()
+        // call `collect()` from futures crate
+        .collect::<Vec<_>>()
+        .await;
+    // let task = tokio::spawn(async move {
+    // futures_util::pin_mut!(stream);
+    // while let Some(client) = stream.next().await {
+    //     counted += 1;
+
+    // }
+    debug!(
+        "Total client requests: {} Cummulative: {:?}",
+        0, counted
+    );
+    // });
+    // task.await.expect("Streamed requests");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -108,7 +156,28 @@ async fn run_stream(client: std::sync::Arc<Client<String>>) -> () {
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 //
 #[instrument]
-fn launch_servers(client: &mut Client<String>) -> Vec<std::sync::mpsc::Sender<Msg>> {
+async fn capacity(mut client: std::sync::Arc<Client<String>>) {
+    let benchmark_start = tokio::time::Instant::now();
+    let t1 = run_stream_par(client.clone());
+    let t2 = run_stream_par(client.clone());
+    t1.await;
+    t2.await;
+    let elapsed = benchmark_start.elapsed().as_micros() as f64;
+    println!(
+        "Throughput: {:.1} request/s [{} in {}]",
+        1000000.0 * 2. * client.nrequests as f64 / elapsed,
+        client.nrequests, elapsed
+    );
+}
+
+fn main() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init()
+        .expect("Tracing subscriber in benchmark");
+    debug!("Running on thread {:?}", std::thread::current().id());
+    let mut client = Client::<String>::new();
+    let nrequests = client.nrequests;
     let mut servers = vec![];
     println!("Initializing servers");
     for _ in 0..client.nservers {
@@ -116,174 +185,28 @@ fn launch_servers(client: &mut Client<String>) -> Vec<std::sync::mpsc::Sender<Ms
         println!("  - Added address: {}", address);
         servers.push(spawn_server(address));
         if let Some(server) = servers.last() {
-            // Any String will start the server...
             server.send(Msg::Start).unwrap();
+            let secs = std::time::Duration::from_millis(2000);
+            std::thread::sleep(secs);
             debug!("    - The server WAS spawned!");
         } else {
             debug!("    - The server was NOT spawned!");
         };
     }
-    servers
-}
-
-#[instrument]
-async fn launch_clients(mut client: std::sync::Arc<Client<String>>) {
-    let mut clients = vec![client.clone();client.nclients];
-    let mut handles = vec![];
-    for c in clients.into_iter() {
-        handles.push(tokio::spawn(run_stream(c)))
-    }
-    println!("Awaiting clients");
-    let results = futures::future::join_all(handles).await;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Criterion Setup
-//
-// The hang behavior is intermittent.
-// We use Criterion to run 100 iterations which should be sufficient to
-// generate at least one hang across different users/machines.
-//
-fn calibrate_limit(c: &mut Criterion<RequestsPerSecond>) {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init()
-        .expect("Tracing subscriber in benchmark");
-    debug!("Running on thread {:?}", std::thread::current().id());
-    let mut group = c.benchmark_group("Calibrate");
-    let mut client = Client::<String>::new();
-    let nrequests = client.nrequests;
-    let servers = launch_servers(&mut client);
-    // Let the OS catch its breath.
-    let secs = std::time::Duration::from_millis(2000);
-    std::thread::sleep(secs);
     let client = std::sync::Arc::new(client);
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(1500)
+        .worker_threads(10)
         .thread_name("calibrate-limit")
         .thread_stack_size(1 * 1024 * 1024)
         .build()
         .unwrap();
-    group
-        .throughput(Throughput::Elements(client.nrequests as u64))
-        .bench_with_input(
-            BenchmarkId::new("calibrate-limit", client.nrequests),
-            &client.clone(),
-            |b, c| {
-                // Insert a call to `to_async` to convert the bencher to async mode.
-                // The timing loops are the same as with the normal bencher.
-                b.to_async(&tokio_executor)
-                    .iter(|| launch_clients(client.clone()));
-            },
-        );
+    tokio_executor.block_on(async {
+        capacity(client.clone()).await
+    });
     println!("Terminating servers");
     for s in servers.iter() {
         s.send(Msg::Stop).unwrap();
-    }
-    group.finish();
-}
-
-criterion_group! {
-    name = benches;
-    config = alternate_config();
-    targets = calibrate_limit
-}
-
-criterion_main!(benches);
-
-fn alternate_config() -> Criterion<RequestsPerSecond> {
-    Criterion::default()
-        .with_profiler(PProfProfiler::new(3, Output::Protobuf))
-        .with_measurement(RequestsPerSecond)
-        .nresamples(2)
-        .sample_size(100)
-}
-
-// Measure requests per second.
-pub const NANOS_PER_SEC: u64 = 1_000_000_000;
-struct RequestsPerSecond;
-impl criterion::measurement::Measurement for RequestsPerSecond {
-    type Intermediate = std::time::Instant;
-    type Value = std::time::Duration;
-
-    fn start(&self) -> Self::Intermediate {
-        std::time::Instant::now()
-    }
-    fn end(&self, i: Self::Intermediate) -> Self::Value {
-        i.elapsed()
-    }
-    fn add(&self, v1: &Self::Value, v2: &Self::Value) -> Self::Value {
-        *v1 + *v2
-    }
-    fn zero(&self) -> Self::Value {
-        std::time::Duration::from_secs(0)
-    }
-    fn to_f64(&self, val: &Self::Value) -> f64 {
-        let nanos = val.as_secs() * NANOS_PER_SEC + u64::from(val.subsec_nanos());
-        nanos as f64
-    }
-    fn formatter(&self) -> &dyn criterion::measurement::ValueFormatter {
-        &RequestsPerSecondFormatter
-    }
-}
-struct RequestsPerSecondFormatter;
-impl criterion::measurement::ValueFormatter for RequestsPerSecondFormatter {
-    fn format_value(&self, value: f64) -> String {
-        // The value will be in nanoseconds so we have to convert to seconds.
-        format!("{} s", value * 10f64.powi(-9))
-    }
-
-    fn format_throughput(&self, throughput: &criterion::Throughput, value: f64) -> String {
-        match *throughput {
-            criterion::Throughput::Bytes(bytes) => {
-                format!("{} b/sec", bytes as f64 / (value * 10f64.powi(-9)))
-            }
-            criterion::Throughput::Elements(elems) => {
-                format!("{} req/sec", elems as f64 / (value * 10f64.powi(-9)))
-            }
-            criterion::Throughput::Bytes(_) => todo!(),
-            criterion::Throughput::Elements(_) => todo!(),
-        }
-    }
-
-    fn scale_values(&self, ns: f64, values: &mut [f64]) -> &'static str {
-        for val in values {
-            *val *= 10f64.powi(-9);
-        }
-        "sec"
-    }
-
-    fn scale_throughputs(
-        &self,
-        _typical: f64,
-        throughput: &Throughput,
-        values: &mut [f64],
-    ) -> &'static str {
-        match *throughput {
-            Throughput::Bytes(bytes) => {
-                // Convert nanoseconds/iteration to bytes/second.
-                for val in values {
-                    *val = (bytes as f64) / (*val * 10f64.powi(-9))
-                }
-                "b/sec"
-            }
-            Throughput::Elements(elems) => {
-                for val in values {
-                    *val = (elems as f64) / (*val * 10f64.powi(-9))
-                }
-                "req/sec"
-            }
-        }
-    }
-
-    fn scale_for_machines(&self, values: &mut [f64]) -> &'static str {
-        // Convert values in nanoseconds to seconds.
-        for val in values {
-            *val *= 10f64.powi(-9);
-        }
-
-        "sec"
     }
 }
 
@@ -324,8 +247,8 @@ impl Client<String> {
 ////////////////////////////////////////////////////////////////////////////////
 // Server Code
 //
-// A simple TCP server rules out anything Hyper server related.
-// Client stress examples are self contained, hence reproducible
+// This rules out anything Hyper server related.
+// This also means the example is self contained, hence reproducible
 //
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
@@ -353,7 +276,6 @@ enum Msg {
     Stop,
 }
 
-// Connect the client session to a random server ip:port (String).
 fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -375,9 +297,8 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
     tx
 }
 
-// This server eliminates Hyper server code as an explanation for
-// any client behavior while stressed.
-// A lean TCP server for that always responds with Hello World! to a request.
+// We need a server that eliminates Hyper server code as an explanation.
+// This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
 fn init_mio_server(address: std::string::String) {
     debug!("Server: {}", address);
@@ -461,7 +382,7 @@ fn init_mio_server(address: std::string::String) {
                         .write_all(RESPONSE.as_bytes())
                         .unwrap();
 
-                    // Use existing connection ("keep-alive") - go back to reading
+                    // Re-use existing connection ("keep-alive") - switch back to reading
                     poll.registry()
                         .reregister(
                             sockets.get_mut(&token).unwrap(),
@@ -476,7 +397,7 @@ fn init_mio_server(address: std::string::String) {
     }
 }
 
-// Make server startup robust to existing listener on the same ip:port.
+// Make server startup robust to existing listener on the same address.
 fn reuse_mio_listener(
     addr: &std::net::SocketAddr,
 ) -> Result<mio::net::TcpListener, std::convert::Infallible> {
