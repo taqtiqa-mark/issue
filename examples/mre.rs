@@ -1,7 +1,5 @@
-// use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::StreamExt;
-use lazy_static::lazy_static; // 1.4.0
-// use pprof::criterion::{Output, PProfProfiler};
+use lazy_static::lazy_static;
 use std::io::{Read, Write};
 use std::sync::Mutex;
 use tracing::instrument;
@@ -19,19 +17,19 @@ use tracing::{self, debug};
 
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
-        let requests = 100_000;
+        let requests = 1_000_000;
         let cpus = num_cpus::get(); // Server tasks to start
-        let clients = cpus*50;         // Client tasks to start
-        let servers = cpus*50;
-        let streamed = requests/clients; // Requests per stream
-        let iterations = 100;       // Criteron samples
+        let clients = cpus * 20; // Client tasks to start
+        let servers = cpus * 20;
+        let streamed = requests / clients; // Requests per stream
+        let iterations = 100; // Criteron samples
         Client {
             addresses: vec![],
             session: hyper::Client::new(),
-            concurrency: 80,
+            concurrency: 128,
             count: 1,
             counted: 0,
-            duration: std::time::Duration::new(0,0),
+            duration: std::time::Duration::new(0, 0),
             nclients: clients,
             nservers: servers,
             nstreamed: streamed,
@@ -50,58 +48,87 @@ impl<T: 'static> Default for Client<T> {
 /// For a detailed description of this setup, see:
 /// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
 #[instrument]
-fn make_stream<'client>(
+// futures::stream::Collect<futures::stream::BufferUnordered<futures::stream::FuturesUnordered<hyper::client::ResponseFuture>>>
+// std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>>
+async fn make_stream<'client>(
     client: &'client Client<String>,
-) -> impl futures::Stream<Item = usize> + 'client {
+) -> std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> {
+    // Allocate each stream to one of the servers started
+    let mut requests: Vec<hyper::client::ResponseFuture> = vec![];
+    let it = client
+        .addresses
+        .iter()
+        .cycle()
+        .take(client.nstreamed)
+        .cloned();
+    let vec = it.collect::<Vec<String>>();
+    let urls = vec!["http://".to_owned(); client.nstreamed];
+    let urls = urls.into_iter().zip(vec).map(|(s, t)| s + &t);
+    let urls = urls.into_iter().map(|u| u.parse::<hyper::Uri>().unwrap());
+    // // Take-1: Makes 256 'handshake complete' then endlessly connect-drop
+    // urls.into_iter()
+    //     .map(|url| async move { client.session.get(url) } )
+    //     .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
+    //     .collect::<Vec<_>>()
+    //     .await
 
-    let stream = async_stream::stream! {
-        // Allocate each stream to one of the servers started
-        let it = client.addresses.iter().cycle().take(client.nstreamed).cloned();
-        let vec = it.collect::<Vec<String>>();
-        let urls = vec!["http://".to_owned(); client.nstreamed];
-        let urls = urls.into_iter()
-                        .zip(vec)
-                        .map(|(s,t)|s+&t)
-                        .collect::<Vec<String>>();
-        let urls = urls.into_iter()
-                        .map(|u|u.parse::<hyper::Uri>().unwrap())
-                        .collect::<Vec<hyper::Uri>>();
-        for url in urls.iter() {
-            let query_start = tokio::time::Instant::now();
-            debug!("URL String: {} URL Parsed: {}", &url, url);
-            let mut response = client.session.get(url.clone()).await.expect("Hyper response");
-            let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
-            // let (parts, body) = response.into_parts();
-            // This is for Surf client use case
-            //let mut response = session.get("/").await.expect("Surf response");
-            //let body = response.body_string().await.expect("Surf body");
-            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
+    // // Take-2: Makes 256 'handshake complete' then endlessly connect-drop
+    // urls.into_iter()
+    //     .map(|url| async move { client.session.get(url).await } )
+    //     .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
+    //     .collect::<Vec<_>>()
+    //     .await
 
-            yield futures::future::ready(1);
-        }
-    };
-    stream.buffer_unordered(client.concurrency)
+    // Take-3: buffer_unordered(1024) -> 34-38K req/s
+    //         buffer_unordered(128)  -> 38-40K
+    //         buffer_unordered(32 & 64)   -> 36K
+    urls.map(|url| async move { client.session.get(url) })
+        .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
+        .buffer_unordered(128)
+        .collect::<Vec<_>>()
+        .await
 }
 
 #[instrument]
-async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
-    // let task = tokio::spawn(async move {
-        println!("Run Stream. Thread: {:?}", std::thread::current().id());
-        let client = client.as_ref();
-        let stream =  make_stream(client);
-        let mut counted =0;
-        futures_util::pin_mut!(stream);
-        while let Some(_client) = stream.next().await {
-            counted += 1;
-            debug!("Stream next polled. Thread: {:?}", std::thread::current().id());
-        }
-        debug!(
-            "Total client requests: {} Cumulative: {:?}",
-            0, counted
-        );
-    // });
-    // Make Clippy quiet about async returning async: await now.
-    // task.await.expect("Stream, or ConcurrentIterator")
+async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> std::vec::Vec<hyper::Body> {
+    println!("Run Stream. Thread: {:?}", std::thread::current().id());
+    let client = client.as_ref();
+    // let responses: std::vec::Vec<hyper::client::ResponseFuture> = make_stream(client).await;
+
+    // // Take-1
+    // // Take-2: 17K req/s
+    // let responses: std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> = make_stream(client).await;
+
+    // Take-3
+    let responses: std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> =
+        make_stream(client).await;
+
+    // // Take-2:
+    // // When `.await`ed there is a vector of Result<hyper::Response<hyper::Body>, hyper::Error>
+    // responses.into_iter()
+    //     .map(read_body)
+    //     .collect::<futures::stream::FuturesUnordered<_>>()
+    //     .collect::<Vec<_>>()
+    //     .await
+
+    // Take-3:
+    // When `.await`ed there is a vector of Result<hyper::Response<hyper::Body>, hyper::Error>
+    responses
+        .into_iter()
+        .map(read_body)
+        .collect::<futures::stream::FuturesUnordered<_>>()
+        .collect::<Vec<hyper::Body>>()
+        .await
+}
+
+// Take-2: also hits the 256 connection limit per client.
+use serde::Deserialize;
+async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -> hyper::Body {
+    //let body = result?;
+    match result {
+        Ok(r) => r.into_body(),
+        Err(e) => hyper::Body::empty(),
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -111,75 +138,28 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> () {
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 //
 #[instrument]
-async fn capacity(mut client: std::sync::Arc<Client<String>>) {
-    let mut clients = vec![client.clone();client.nclients];
+async fn capacity(client: std::sync::Arc<Client<String>>) {
+    let mut clients = vec![client.clone(); client.nclients];
     let mut handles = vec![];
-    let parallel_requests = 10;
+    let parallel_requests = client.nclients;
     for c in clients.into_iter() {
         handles.push(tokio::spawn(run_stream(c)))
     }
     let benchmark_start = tokio::time::Instant::now();
     println!("Awaiting clients");
-    // for h in handles.into_iter() {
-    //     println!("Awaiting Tokio task");
-    //     h.await.expect("")
-    // }
     let results = futures::future::join_all(handles).await;
-    //The FuturesUnordered is slower than join_all
-    // let mut handles = clients.into_iter()
-    //     .map(|c| tokio::spawn(run_stream(c)))
-    //     .collect::<futures::stream::FuturesUnordered<_>>();
-    // while let Some(res) = handles.next().await { }
-    // // Buffering does not seem to work.
-    // // let mut pf = futures::stream::iter(clients)
-    // //     .map(|c| {
-    // //         // let client = client.clone();
-    // //         tokio::spawn(run_stream(c))
-    // //     })
-    // //     .buffer_unordered(parallel_requests);
-    // // let mut counted = 0;
-    // //
-    // // This `while let`is very slow.
-    // //
-    // // while let parallel_result = pf.next() {
-    // //     parallel_result.await;
-    // //     counted += 1;
-    // //     debug!("Parallel client polled. Thread: {:?}", std::thread::current().id());
-    // // }
-    // // This is faster than `while let`
-    // // pf
-    // //     .for_each(|b| async {
-    // //         match b {
-    // //             Ok(()) => println!("Parallel stream completed"),
-    // //             Err(e) => eprintln!("Got a tokio::JoinError: {}", e),
-    // //         }
-    // //     })
-    // //     .await;
-    // //
-    // Additional spawn allows for parallel running of streams.
-    // let t1 = tokio::spawn(run_stream(client.clone()));
-    // let t2 = tokio::spawn(run_stream(client.clone()));
-    // let t3 = tokio::spawn(run_stream(client.clone()));
-    // let t4 = tokio::spawn(run_stream(client.clone()));
-    // let t5 = tokio::spawn(run_stream(client.clone()));
-    // let t6 = tokio::spawn(run_stream(client.clone()));
-    // t1.await.expect("Parallel stream 1");
-    // t2.await.expect("Parallel stream 2");
-    // t3.await.expect("Parallel stream 3");
-    // t4.await.expect("Parallel stream 4");
-    // t5.await.expect("Parallel stream 5");
-    // t6.await.expect("Parallel stream 6");
     let elapsed = benchmark_start.elapsed().as_micros() as f64;
     println!(
         "Throughput: {:.1} request/s [{} in {}]",
         1000000.0 * 2. * client.nrequests as f64 / elapsed,
-        client.nrequests, elapsed
+        client.nrequests,
+        elapsed
     );
 }
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::INFO)
         .try_init()
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
@@ -208,9 +188,7 @@ fn main() {
         .thread_stack_size(4 * 1024 * 1024)
         .build()
         .unwrap();
-    tokio_executor.block_on(async {
-        capacity(client.clone()).await
-    });
+    tokio_executor.block_on(async { capacity(client.clone()).await });
     println!("Terminating servers");
     for s in servers.iter() {
         s.send(Msg::Stop).unwrap();
