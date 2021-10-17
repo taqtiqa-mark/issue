@@ -1,7 +1,5 @@
 use futures::StreamExt;
-use lazy_static::lazy_static;
 use std::io::{Read, Write};
-use std::sync::Mutex;
 use tracing::instrument;
 use tracing::{self, debug};
 
@@ -42,19 +40,16 @@ impl<T: 'static> Default for Client<T> {
 /// Setup Streams for HTTP GET
 ///
 /// Invoke client to get URL, return a stream of response durations.
-/// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
-/// Async code runs on the caller thread.
+/// Allocate each client `get` to one of the servers started.
+/// Note: We do *not* spawn new threads.
+/// Here, requests are concurrent not parallel.
+/// Async code runs on the caller thread - where parallelism occurs.
 ///
-/// For a detailed description of this setup, see:
-/// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
 #[instrument]
-// futures::stream::Collect<futures::stream::BufferUnordered<futures::stream::FuturesUnordered<hyper::client::ResponseFuture>>>
-// std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>>
 async fn make_stream<'client>(
     client: &'client Client<String>,
 ) -> std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> {
-    // Allocate each stream to one of the servers started
-    let mut requests: Vec<hyper::client::ResponseFuture> = vec![];
+
     let it = client
         .addresses
         .iter()
@@ -65,23 +60,7 @@ async fn make_stream<'client>(
     let urls = vec!["http://".to_owned(); client.nstreamed];
     let urls = urls.into_iter().zip(vec).map(|(s, t)| s + &t);
     let urls = urls.into_iter().map(|u| u.parse::<hyper::Uri>().unwrap());
-    // // Take-1: Makes 256 'handshake complete' then endlessly connect-drop
-    // urls.into_iter()
-    //     .map(|url| async move { client.session.get(url) } )
-    //     .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
-    //     .collect::<Vec<_>>()
-    //     .await
 
-    // // Take-2: Makes 256 'handshake complete' then endlessly connect-drop
-    // urls.into_iter()
-    //     .map(|url| async move { client.session.get(url).await } )
-    //     .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
-    //     .collect::<Vec<_>>()
-    //     .await
-
-    // Take-3: buffer_unordered(1024) -> 34-38K req/s
-    //         buffer_unordered(128)  -> 38-40K
-    //         buffer_unordered(32 & 64)   -> 36K
     urls.map(|url| async move { client.session.get(url) })
         .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
         .buffer_unordered(128)
@@ -92,27 +71,11 @@ async fn make_stream<'client>(
 #[instrument]
 async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> std::vec::Vec<hyper::Body> {
     println!("Run Stream. Thread: {:?}", std::thread::current().id());
+
     let client = client.as_ref();
-    // let responses: std::vec::Vec<hyper::client::ResponseFuture> = make_stream(client).await;
-
-    // // Take-1
-    // // Take-2: 17K req/s
-    // let responses: std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> = make_stream(client).await;
-
-    // Take-3
     let responses: std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> =
         make_stream(client).await;
 
-    // // Take-2:
-    // // When `.await`ed there is a vector of Result<hyper::Response<hyper::Body>, hyper::Error>
-    // responses.into_iter()
-    //     .map(read_body)
-    //     .collect::<futures::stream::FuturesUnordered<_>>()
-    //     .collect::<Vec<_>>()
-    //     .await
-
-    // Take-3:
-    // When `.await`ed there is a vector of Result<hyper::Response<hyper::Body>, hyper::Error>
     responses
         .into_iter()
         .map(read_body)
@@ -121,13 +84,10 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> std::vec
         .await
 }
 
-// Take-2: also hits the 256 connection limit per client.
-use serde::Deserialize;
 async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -> hyper::Body {
-    //let body = result?;
     match result {
         Ok(r) => r.into_body(),
-        Err(e) => hyper::Body::empty(),
+        Err(_e) => hyper::Body::empty(),
     }
 }
 
@@ -139,15 +99,14 @@ async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -
 //
 #[instrument]
 async fn capacity(client: std::sync::Arc<Client<String>>) {
-    let mut clients = vec![client.clone(); client.nclients];
+    let clients = vec![client.clone(); client.nclients];
     let mut handles = vec![];
-    let parallel_requests = client.nclients;
     for c in clients.into_iter() {
         handles.push(tokio::spawn(run_stream(c)))
     }
     let benchmark_start = tokio::time::Instant::now();
     println!("Awaiting clients");
-    let results = futures::future::join_all(handles).await;
+    futures::future::join_all(handles).await;
     let elapsed = benchmark_start.elapsed().as_micros() as f64;
     println!(
         "Throughput: {:.1} request/s [{} in {}]",
@@ -164,7 +123,6 @@ fn main() {
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut client = Client::<String>::new();
-    let nrequests = client.nrequests;
     let mut servers = vec![];
     println!("Initializing servers");
     for _ in 0..client.nservers {
