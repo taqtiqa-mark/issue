@@ -1,9 +1,5 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use futures::StreamExt;
-use lazy_static::lazy_static; // 1.4.0
-use pprof::criterion::{Output, PProfProfiler};
 use std::io::{Read, Write};
-use std::sync::Mutex;
 use tracing::instrument;
 use tracing::{self, debug};
 
@@ -17,56 +13,80 @@ use tracing::{self, debug};
 /// 188-305 Server Code
 ///
 
+impl<T: 'static> Default for Client<T> {
+    fn default() -> Self {
+        let nrequests = 1_000_000;
+        let cpus = num_cpus::get();           // 2 on initial dev system
+        let nclients = cpus * 20;             // Clients to start (parallelism)
+        let concurrency = 128;                // Concurrent requests
+        let nservers = cpus * 20;             // Servers to start
+        let nstreamed = nrequests / nclients; // Requests per client
+        Client {
+            addresses: vec![],
+            session: hyper::Client::new(),
+            concurrency,
+            count: 1,
+            counted: 0,
+            nclients,
+            nservers,
+            nstreamed,
+            nrequests,
+        }
+    }
+}
+
 /// Setup Streams for HTTP GET
 ///
 /// Invoke client to get URL, return a stream of response durations.
-/// Note: Does *not* spawn new threads. Requests are concurrent not parallel.
-/// Async code runs on the caller thread.
+/// Allocate each client `get` to one of the servers started.
+/// Note: We do *not* spawn new threads.
+/// Here, requests are concurrent not parallel.
+/// Async code runs on the caller thread - where parallelism occurs.
 ///
-/// For a detailed description of this setup, see:
-/// https://pkolaczk.github.io/benchmarking-cassandra-with-rust-streams/
-
 #[instrument]
-fn make_stream<'client>(client: Client<String>) -> impl futures::Stream + 'client {
-    let concurrency_limit = 5_000;
+async fn make_stream<'client>(
+    client: &'client Client<String>,
+) -> std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> {
 
-    let it = client.addresses.iter().cycle().take(client.count).cloned();
+    let it = client
+        .addresses
+        .iter()
+        .cycle()
+        .take(client.nstreamed)
+        .cloned();
     let vec = it.collect::<Vec<String>>();
-    let mut url: String = "http://".to_owned();
-    let strm = async_stream::stream! {
-        for i in 0..client.count {
-            let query_start = tokio::time::Instant::now();
-            url.push_str(&vec[i]);
-            let mut response = client.session.get(url.parse::<hyper::Uri>().unwrap()).await.expect("Hyper response");
-            let body = hyper::body::to_bytes(response.body_mut()).await.expect("Body");
-            // let (parts, body) = response.into_parts();
-            // This is for Surf client use case
-            //let mut response = session.get("/").await.expect("Surf response");
-            //let body = response.body_string().await.expect("Surf body");
-            debug!("\nSTATUS:{:?}\nBODY:\n{:?}", response.status(), body);
-            yield futures::future::ready(query_start.elapsed());
-        }
-    };
-    strm.buffer_unordered(concurrency_limit)
+    let urls = vec!["http://".to_owned(); client.nstreamed];
+    let urls = urls.into_iter().zip(vec).map(|(s, t)| s + &t);
+    let urls = urls.into_iter().map(|u| u.parse::<hyper::Uri>().unwrap());
+
+    urls.map(|url| async move { client.session.get(url) })
+        .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
+        .buffer_unordered(128)
+        .collect::<Vec<_>>()
+        .await
 }
 
 #[instrument]
-async fn run_stream(client: Client<String>) {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            tokio::task::spawn(async move {
-                debug!("About to make stream");
-                let stream = make_stream(client);
-                futures_util::pin_mut!(stream);
-                while let Some(_duration) = stream.next().await {
-                    debug!("Stream next polled.");
-                }
-            })
-            .await
-            .expect("Client task");
-        })
-        .await;
+async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> std::vec::Vec<hyper::Body> {
+    println!("Run Stream. Thread: {:?}", std::thread::current().id());
+
+    let client = client.as_ref();
+    let responses: std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> =
+        make_stream(client).await;
+
+    responses
+        .into_iter()
+        .map(read_body)
+        .collect::<futures::stream::FuturesUnordered<_>>()
+        .collect::<Vec<hyper::Body>>()
+        .await
+}
+
+async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -> hyper::Body {
+    match result {
+        Ok(r) => r.into_body(),
+        Err(_e) => hyper::Body::empty(),
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -76,81 +96,60 @@ async fn run_stream(client: Client<String>) {
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 //
 #[instrument]
-async fn capacity(count: usize) {
-    debug!("Initialize client");
-    let mut client = Client::<String>::new();
-    client.count = count;
-    let address = client.add_address();
-    let server = Some(spawn_server(address));
-    if let Some(ref server) = server {
-        // Any String will start the server...
-        server.send(Msg::Echo("Start".to_string())).unwrap();
-        let secs = tokio::time::Duration::from_millis(2000);
-        tokio::time::sleep(secs).await;
-        println!("The server WAS spawned!");
-    } else {
-        println!("The server was NOT spawned!");
-    };
+async fn capacity(client: std::sync::Arc<Client<String>>) {
+    let clients = vec![client.clone(); client.nclients];
+    let mut handles = vec![];
+    for c in clients.into_iter() {
+        handles.push(tokio::spawn(run_stream(c)))
+    }
     let benchmark_start = tokio::time::Instant::now();
-    let client = client.clone();
-    let ftr = run_stream(client);
-    ftr.await;
-    // This should increase throughput - but it halves it....
-    //
-    // let ftr2 = run_stream(&client);
-    // ftr2.await;
-    //
-    // Stop the server thread using the channel pattern...
-    // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
-    //drop(server.take().expect("MIO server stopped"));
-    // drop(client);
+    println!("Awaiting clients");
+    futures::future::join_all(handles).await;
+    let elapsed = benchmark_start.elapsed().as_micros() as f64;
     println!(
-        "Throughput: {:.1} request/s",
-        1000000.0 * count as f64 / benchmark_start.elapsed().as_micros() as f64
+        "Throughput: {:.1} request/s [{} in {}]",
+        1000000.0 * 2. * client.nrequests as f64 / elapsed,
+        client.nrequests,
+        elapsed
     );
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Criterion Setup
-//
-// The hang behavior is intermittent.
-// We use Criterion to run 100 iterations which should be sufficient to
-// generate at least one hang across different users/machines.
-//
-fn calibrate_limit(c: &mut Criterion) {
+fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .try_init()
         .expect("Tracing subscriber in benchmark");
     debug!("Running on thread {:?}", std::thread::current().id());
-    let mut group = c.benchmark_group("Calibrate");
-    let count = 100_000;
+    let mut client = Client::<String>::new();
+    let mut servers = vec![];
+    println!("Initializing servers");
+    for _ in 0..client.nservers {
+        let address = client.add_address();
+        println!("  - Added address: {}", address);
+        servers.push(spawn_server(address));
+        if let Some(server) = servers.last() {
+            server.send(Msg::Start).unwrap();
+            debug!("    - The server WAS spawned!");
+        } else {
+            debug!("    - The server was NOT spawned!");
+        };
+    }
+    let secs = std::time::Duration::from_millis(2000);
+    std::thread::sleep(secs);
+    let client = std::sync::Arc::new(client);
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(8)
+        .worker_threads(120)
         .thread_name("calibrate-limit")
         .thread_stack_size(4 * 1024 * 1024)
         .build()
         .unwrap();
-    group.bench_with_input(
-        BenchmarkId::new("calibrate-limit", count),
-        &count,
-        |b, &_s| {
-            // Insert a call to `to_async` to convert the bencher to async mode.
-            // The timing loops are the same as with the normal bencher.
-            b.to_async(&tokio_executor).iter(|| capacity(count));
-        },
-    );
-    group.finish();
+    tokio_executor.block_on(async { capacity(client.clone()).await });
+    println!("Terminating servers");
+    for s in servers.iter() {
+        s.send(Msg::Stop).unwrap();
+    }
 }
-
-criterion_group! {
-    name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(3, Output::Protobuf));
-    targets = calibrate_limit
-}
-
-criterion_main!(benches);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Code
@@ -159,7 +158,13 @@ criterion_main!(benches);
 struct Client<T> {
     addresses: std::vec::Vec<T>,
     session: hyper::Client<hyper::client::HttpConnector>,
+    concurrency: usize,
     count: usize,
+    counted: usize,
+    nclients: usize,
+    nservers: usize,
+    nstreamed: usize,
+    nrequests: usize,
 }
 
 impl Client<String> {
@@ -172,18 +177,9 @@ impl Client<String> {
         let address = listener.local_addr().unwrap().to_string();
         let mut url: String = "".to_owned();
         url.push_str(&address);
+        debug!("Added address: {}", address);
         self.addresses.push(url.clone());
         url
-    }
-}
-
-impl<T: 'static> Default for Client<T> {
-    fn default() -> Self {
-        Client {
-            addresses: vec![],
-            session: hyper::Client::new(),
-            count: 1,
-        }
     }
 }
 
@@ -193,13 +189,10 @@ impl<T: 'static> Default for Client<T> {
 // This rules out anything Hyper server related.
 // This also means the example is self contained, hence reproducible
 //
-lazy_static! {
-    static ref ADDR_VEC: Mutex<Vec<String>> = Mutex::new(vec![]);
-}
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
 Connection: keep-alive
-Content-Length: 14
+Content-Length: 13
 
 Hello World!
 ";
@@ -218,20 +211,27 @@ fn is_double_crnl(window: &[u8]) -> bool {
 //
 // https://matklad.github.io/2018/03/03/stopping-a-rust-worker.html
 enum Msg {
-    Echo(String),
+    Start,
+    Stop,
 }
 
 fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
+        while let Ok(msg) = &rx.recv() {
             match msg {
-                Msg::Echo(_msg) => {
+                Msg::Start => {
+                    debug!("    - The server should start.");
                     init_mio_server(address.clone());
+                    debug!("      - The server has started.");
+                }
+                Msg::Stop => {
+                    debug!("    - The server should stop.");
+                    return;
                 }
             }
         }
-        println!("The server has stopped!");
+        debug!("The server has stopped!");
     });
     tx
 }
@@ -239,44 +239,10 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
 // We need a server that eliminates Hyper server code as an explanation.
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
-fn response<'response>() -> String {
-    // simulate some work being done
-    let uuidv4: uuid::Uuid;
-    let uuidv5: uuid::Uuid;
-    // let handle = std::thread::spawn(move || {
-    let mut buf = [b'!'; 49];
-    let uuidv4 = uuid::Uuid::new_v4();
-    let uuidv5 = uuid::Uuid::new_v5(&uuidv4, "issue".as_bytes());
-    // .expect("Generate UUID");
-    uuidv5.to_urn().encode_lower(&mut buf);
-    let secs = std::time::Duration::from_millis(65);
-    std::thread::sleep(secs);
-    // debug!("UUID: {}", uuid);
-    // });
-    // handle.join();
-    let response = format!(
-        r#"
-HTTP/1.1 200 OK
-Content-Type: text/json
-Connection: keep-alive
-Content-Length: 103
-
-{{
-    "v4": "{}",
-    "v5": "{}"
-}}
-"#,
-        uuidv4.to_hyphenated(),
-        uuidv5.to_hyphenated()
-    );
-    debug!("{}", response);
-    response
-}
-
 fn init_mio_server(address: std::string::String) {
-    debug!("{}", address);
+    debug!("Server: {}", address);
     let mut listener =
-        reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to URL");
+        reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to address");
     let mut poll = mio::Poll::new().unwrap();
     poll.registry()
         .register(&mut listener, mio::Token(0), mio::Interest::READABLE)
@@ -349,8 +315,6 @@ fn init_mio_server(address: std::string::String) {
                 }
                 token if event.is_writable() => {
                     requests.get_mut(&token).unwrap().clear();
-                    let response = &response()[..];
-                    debug!("{:?}", response);
                     sockets
                         .get_mut(&token)
                         .unwrap()

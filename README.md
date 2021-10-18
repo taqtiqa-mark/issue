@@ -1,78 +1,133 @@
-# Issue: Reproducible Hang
+# Issue: Reproducible Hyper Client Hang
 
-This benchmark demonstrates a reproducible hang in Hyper or Tokio or Futures
-Listening on address: `127.0.0.1:8888`
+This benchmark demonstrates a reproducible hang in Hyper client.
+To see if the default settings reproduce a hang on your system:
+
+## Release Test
+
+```bash
+cargo run --example mre -Z unstable-options --profile release -- --nocapture &> mre-notrace.log
+```
+
+## Trace Log
+
+Set the tracing subscriber level to `TRACE`
 
 ```rust
-RUST_LOG=trace cargo bench --bench mre -Z unstable-options --profile release -- calibrate-limit --nocapture &> bench-trace.log
+fn main() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
 ```
 
-Flamegraph
+Then run the command:
 
 ```bash
-echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
-cargo bench --bench mre -- calibrate-limit --nocapture --profile-time 130
-go tool pprof -http=:8080 ./target/criterion/Calibrate/calibrate-limit/100000/profile/profile.pb
-
-go tool pprof -svg profile300.gz ./../target/criterion/Calibrate/calibrate-limit/100000/profile/profile.pb
+RUST_LOG=trace HYPER=trace cargo run --example mre -Z unstable-options --profile dev -- --nocapture &> mre-trace.log
 ```
 
-## TCP v1: MIO (40k)
+## Strace Log
+
+To use the [`strace-parser`](https://gitlab.com/gitlab-com/support/toolbox/strace-parser)
+(expect in the order of 18M lines, 60MB, of strace output for a release build):
 
 ```bash
-$ cargo run --example tcp --profile release -Z unstable-options
-$ wrk -d 30s -t 4 -c 128 http://127.0.0.1:9000/
-Running 30s test @ http://127.0.0.1:9000/
-  4 threads and 128 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     3.54ms    3.83ms  52.38ms   88.34%
-    Req/Sec    10.66k     4.53k   20.50k    59.73%
-  1276169 requests in 30.06s, 107.10MB read
-Requests/sec:  42447.04
-Transfer/sec:      3.56MB
+strace -fttTyyy -s 1024 target/release/examples/mre 2>&1 |xz --threads=0 --compress --extreme /tmp/mre-release-strace.log.xz
 ```
 
-## TCP v2: Async-std (10k r/s)
+You will need `ctl-c` once the output stream halts, producing a compressed
+file `xz` cannot decompress.
+To extract the decompressed data:
 
 ```bash
-$ wrk -d 30s -t 4 -c 128 http://127.0.0.1:8080/
-Running 30s test @ http://127.0.0.1:8080/
-  4 threads and 128 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    12.22ms   10.40ms  89.82ms   74.17%
-    Req/Sec     2.07k   662.36     4.04k    67.98%
-  247422 requests in 30.08s, 20.76MB read
-  Socket errors: connect 0, read 42866, write 204556, timeout 0
-Requests/sec:   8224.50
-Transfer/sec:    706.79KB
+xzcat --ignore-check /tmp/mre-release-strace.log.xz >/tmp/mre-release-strace.log
 ```
 
-## TCP v3: StdLib sync, backpressure (9k)
+For `dev` builds with/without `HYPER=trace` and `RUST_LOG=trace` sizes and runtimes
+increase substantially.
+
+## Overview
+
+There are two components to this MRE: server and client.
+
+The server is a  a simple TCP server (mio crate) that always responds with
+the HTTP 200 hello world string (stored in memory).
+
+Several servers are started to help generate the required request load.
+This should allow the hang behavior to be replicated with needing to adjust
+system level configuration, e.g. the time a port must be idle before being
+reused, etc.
+
+Several clients are started to generate the required request load.
+Parallelism is achieved by running client via `tokio::task::spawn`.
+Concurrency is controlled by using `buffer_unordered` on a collection of
+`FuturesUnordered`.
+
+## Settings
+
+If the default settings do not trigger a hang immediately, you may have to
+increase some of the configurable values.
+
+Configurable values are set as `Client` defaults, located at the top
+of `[examples/mre.rs](examples/mre.rs)`:
+
+Example:
+
+| Setting       | MRE | MRE-OK |
+|---------------+-----+--------|
+| `nrequests`   | 1M  | 1M     |
+| `nclients`    | 40  | 10     |
+| `nservers`    | 40  | 10     |
+| `concurrency` | 128 | 128    |
+
+## Baseline: Correct behavior
+
+The example `mre-ok.rs` illustrates expected behavior, and can be useful in
+establishing a baseline, e.g. relative numbers of function calls, etc.
 
 ```bash
-$ wrk -d 30s -t 4 -c 128 http://127.0.0.1:7878/
-Running 30s test @ http://127.0.0.1:7878/
-  4 threads and 128 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     6.91ms    7.14ms  67.68ms   85.71%
-    Req/Sec     2.49k   807.17     5.62k    67.05%
-  296466 requests in 30.08s, 24.88MB read
-  Socket errors: connect 0, read 34818, write 261634, timeout 0
-Requests/sec:   9854.39
-Transfer/sec:    846.86KB```
+$ cargo run --example mre-ok -Z unstable-options --profile release -- --nocapture &> mre-ok-notrace.log
+   Compiling mre v0.2.0 (/home/hedge/src/issue)
+    Finished release [optimized] target(s) in 1m 23s
+     Running `target/release/examples/mre-ok --nocapture`
+Initializing servers
+  - Added address: 127.0.0.1:24777
+  - Added address: 127.0.0.1:15393
+  - Added address: 127.0.0.1:25073
+  - Added address: 127.0.0.1:36457
+  - Added address: 127.0.0.1:17921
+  - Added address: 127.0.0.1:32145
+  - Added address: 127.0.0.1:28547
+  - Added address: 127.0.0.1:19611
+  - Added address: 127.0.0.1:20227
+  - Added address: 127.0.0.1:23647
+Awaiting clients
+Run Stream. Thread: ThreadId(88)
+Run Stream. Thread: ThreadId(26)
+Run Stream. Thread: ThreadId(89)
+Run Stream. Thread: ThreadId(55)
+Run Stream. Thread: ThreadId(90)
+Run Stream. Thread: ThreadId(56)
+Run Stream. Thread: ThreadId(91)
+Run Stream. Thread: ThreadId(57)
+Run Stream. Thread: ThreadId(92)
+Run Stream. Thread: ThreadId(15)
+Throughput: 36489.9 request/s [1000000 in 54809630]
+Terminating servers
 ```
 
-## TCP v4: StdLib sync, no-backpressure (11k)
+## Observations
 
-```bash
-$ wrk -d 30s -t 4 -c 128 http://127.0.0.1:7878/
-Running 30s test @ http://127.0.0.1:7879/
-  4 threads and 128 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     5.81ms    5.89ms  67.65ms   84.71%
-    Req/Sec     2.96k   783.08     5.67k    63.28%
-  352359 requests in 30.09s, 29.57MB read
-  Socket errors: connect 0, read 41043, write 311315, timeout 0
-Requests/sec:  11711.94
-Transfer/sec:      0.98MB
-```
+### Too many files open (transitory?)
+
+There is one idiosyncratic behavior I have observed that might be a clue to
+what is going wrong - but could be a false lead:
+
+For some MRE parameters that generate a hang less reliably, e.g. one out of
+three runs, I did observe a 'too many files open' error logged to std out
+(anywhere from 100 to 400 such messages) - then they stopped and the hang
+occurred. Inspection via `lsof` and `ls /proc/.../fd` did not show too many
+files open once messages stopped.  This may be a transitory state?
+
+For parameter values that reliably trigger the hang there, so far, have been
+no such messages - just straight to the hang behavior after a short period
+of running.
