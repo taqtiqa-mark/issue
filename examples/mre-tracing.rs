@@ -1,25 +1,35 @@
 use futures::StreamExt;
 use std::io::{Read, Write};
 use tracing::instrument;
-use tracing::{self, debug};
+use tracing::{self, debug, error, info, span, trace, warn};
+//use tracing_attributes::instrument;
+use tracing_subscriber::prelude::*;
+
+//use opentelemetry::api::Provider;
+use opentelemetry::global;
+use opentelemetry::trace::Tracer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// Build on mre.rs by adding debug tooling.
 
 /// Table of Contents
 ///
 ///     LoC Description
-///   19-69 Setup Streams for HTTP GET
-///  70-109 Start Server and Client
-/// 110-152 Criterion Setup
-/// 153-187 Utility Code
-/// 188-305 Server Code
+///   16-38 Parameters
+///   38-92 Setup Concurrent and Parallel HTTP GET
+///  93-153 Start Server and Client
+/// 154-185 Utility Code
+/// 186-351 Server Code
 ///
 
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
         let nrequests = 1_000_000;
-        let cpus = num_cpus::get();
-        let nclients = cpus * 5;             // Clients to start (parallelism)
-        let concurrency = 128;                // Concurrent requests
-        let nservers = cpus * 5;             // Servers to start
+        let cpus = num_cpus::get(); // 2 on initial dev system
+        let nclients = cpus; // Clients to start (parallelism)
+        let concurrency = 10; // Concurrent requests
+        let nservers = cpus; // Servers to start
         let nstreamed = nrequests / nclients; // Requests per client
         Client {
             addresses: vec![],
@@ -35,7 +45,7 @@ impl<T: 'static> Default for Client<T> {
     }
 }
 
-/// Setup Streams for HTTP GET
+/// Setup concurrent and parallel HTTP GET
 ///
 /// Invoke client to get URL, return a stream of response durations.
 /// Allocate each client `get` to one of the servers started.
@@ -43,11 +53,11 @@ impl<T: 'static> Default for Client<T> {
 /// Here, requests are concurrent not parallel.
 /// Async code runs on the caller thread - where parallelism occurs.
 ///
-#[instrument]
+
+#[tracing::instrument(level = "trace")]
 async fn make_stream<'client>(
     client: &'client Client<String>,
 ) -> std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> {
-
     let it = client
         .addresses
         .iter()
@@ -61,12 +71,12 @@ async fn make_stream<'client>(
 
     urls.map(|url| async move { client.session.get(url) })
         .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
-        .buffer_unordered(128)
+        .buffer_unordered(client.concurrency)
         .collect::<Vec<_>>()
         .await
 }
 
-#[instrument]
+#[tracing::instrument(level = "trace")]
 async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> std::vec::Vec<hyper::Body> {
     println!("Run Stream. Thread: {:?}", std::thread::current().id());
 
@@ -95,7 +105,7 @@ async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -
 //
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 //
-#[instrument]
+#[tracing::instrument(level = "trace")]
 async fn capacity(client: std::sync::Arc<Client<String>>) {
     let clients = vec![client.clone(); client.nclients];
     let mut handles = vec![];
@@ -114,11 +124,65 @@ async fn capacity(client: std::sync::Arc<Client<String>>) {
     );
 }
 
-fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init()
-        .expect("Tracing subscriber in benchmark");
+use tracing_subscriber::fmt;
+#[tokio::main]
+async fn main() {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6831));
+    // build a Jaeger batch span processor
+    let jaeger_processor = opentelemetry::sdk::trace::BatchSpanProcessor::builder(
+        opentelemetry_jaeger::new_pipeline()
+            .with_service_name("mre")
+            .with_agent_endpoint(addr)
+            .with_tags(vec![opentelemetry::KeyValue::new("exporter", "jaeger")])
+            .init_async_exporter(opentelemetry::runtime::Tokio).expect("Jaeger async exporter"),
+        opentelemetry::runtime::Tokio,
+    )
+    .build();
+
+    // build a Zipkin exporter ()
+    let zipkin_exporter = opentelemetry_zipkin::new_pipeline()
+        .with_service_name("mre")
+        //.with_service_address("127.0.0.1:8080".parse()?)
+        .with_collector_endpoint("http://localhost:9411/api/v2/spans")
+        //.install_batch(opentelemetry::runtime::Tokio)?
+        .init_exporter().expect("Zipkin exporter");
+
+    let provider = opentelemetry::sdk::trace::TracerProvider::builder()
+        // We can build a span processor and pass it into provider.
+        .with_span_processor(jaeger_processor)
+        // For batch span processor, we can also provide the exporter and runtime and use this
+        // helper function to build a batch span processor
+        .with_batch_exporter(zipkin_exporter, opentelemetry::runtime::Tokio)
+        // Same helper function is also available to build a stdout span processor.
+        // this can be useful when debugging flows between OpenTelemetry
+        // and end points like Zipkin or Jaegar
+        // .with_simple_exporter(opentelemetry::sdk::export::trace::stdout::Exporter::new(
+        //     std::io::stdout(),
+        //     true,
+        // ))
+        .build();
+
+    // Get new Tracer from TracerProvider
+    let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "my_app", None);
+    // Create a layer with the configured tracer
+    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    let subscriber = tracing_subscriber::Registry::default().with(telemetry);
+    // let _ = opentelemetry::global::set_tracer_provider(provider);
+
+    // let collector = tracing_subscriber::registry()
+    //     .with(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::TRACE.into()))
+    //     .with(tracing_subscriber::fmt::Subscriber::new().with_writer(std::io::stdout));
+    // //     .with(tracing_subscriber::fmt::Subscriber::new().with_writer(subscriber));
+    //tracing::collect::set_global_default(collector).expect("Unable to set a global collector");
+    // It maybe this is not required
+    tracing::subscriber::set_global_default(subscriber).expect("Unable to set a global subscriber");
+    // tracing_subscriber::fmt()
+    //     .with_max_level(tracing::Level::TRACE)
+    //     .try_init()
+    //     .expect("Tracing subscriber in mre-jaeger");
+
+
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut client = Client::<String>::new();
     let mut servers = vec![];
@@ -136,19 +200,39 @@ fn main() {
     }
     let secs = std::time::Duration::from_millis(2000);
     std::thread::sleep(secs);
-    let client = std::sync::Arc::new(client);
-    let tokio_executor = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(120)
-        .thread_name("calibrate-limit")
-        .thread_stack_size(4 * 1024 * 1024)
-        .build()
-        .unwrap();
-    tokio_executor.block_on(async { capacity(client.clone()).await });
-    println!("Terminating servers");
+    // Trace executed code
+    //tracing::subscriber::with_default(subscriber, || async {
+        // Spans will be sent to the configured OpenTelemetry exporter
+        let root = span!(tracing::Level::TRACE, "app_start", work_units = 2);
+        let _enter = root.enter();
+
+        let client = std::sync::Arc::new(client);
+        // let tokio_executor = tokio::runtime::Builder::new_multi_thread()
+        //     .enable_all()
+        //     .worker_threads(120)
+        //     .thread_name("mre-client-hangs")
+        //     .thread_stack_size(4 * 1024 * 1024)
+        //     .build()
+        //     .unwrap();
+        // tokio_executor.block_on(async {
+            //init_tracer().expect("Tracer setup failed");
+            // let tracer = opentelemetry::global::tracer("jaeger-and-zipkin");
+
+            // let span = tracer.start("first span");
+            // let _guard = opentelemetry::trace::mark_span_as_active(span);
+            capacity(client.clone()).await;
+
+        // });
+
+        error!("This event will be logged in the root span.");
+    //}).await;
+
+    info!("Terminating servers");
     for s in servers.iter() {
         s.send(Msg::Stop).unwrap();
     }
+    // Send remaining spans
+    opentelemetry::global::shutdown_tracer_provider();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -181,6 +265,50 @@ impl Client<String> {
         self.addresses.push(url.clone());
         url
     }
+}
+
+fn init_tracer() -> Result<(), opentelemetry::trace::TraceError> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6831));
+    // build a Jaeger batch span processor
+    let jaeger_processor = opentelemetry::sdk::trace::BatchSpanProcessor::builder(
+        opentelemetry_jaeger::new_pipeline()
+            .with_service_name("mre")
+            .with_agent_endpoint(addr)
+            .with_tags(vec![opentelemetry::KeyValue::new("exporter", "jaeger")])
+            .init_async_exporter(opentelemetry::runtime::Tokio)?,
+        opentelemetry::runtime::Tokio,
+    )
+    .build();
+
+    // build a Zipkin exporter ()
+    let zipkin_exporter = opentelemetry_zipkin::new_pipeline()
+        .with_service_name("mre")
+        //.with_service_address("127.0.0.1:8080".parse()?)
+        .with_collector_endpoint("http://localhost:9411/api/v2/spans")
+        //.install_batch(opentelemetry::runtime::Tokio)?
+        .init_exporter()?;
+
+    let provider = opentelemetry::sdk::trace::TracerProvider::builder()
+        // We can build a span processor and pass it into provider.
+        .with_span_processor(jaeger_processor)
+        // For batch span processor, we can also provide the exporter and runtime and use this
+        // helper function to build a batch span processor
+        .with_batch_exporter(zipkin_exporter, opentelemetry::runtime::Tokio)
+        // Same helper function is also available to build a stdout span processor.
+        .with_simple_exporter(opentelemetry::sdk::export::trace::stdout::Exporter::new(
+            std::io::stdout(),
+            true,
+        ))
+        .build();
+    // Get new Tracer from TracerProvider
+    let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "my_app", None);
+    // Create a layer with the configured tracer
+    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    let subscriber = tracing_subscriber::Registry::default().with(telemetry);
+    let _ = opentelemetry::global::set_tracer_provider(provider);
+
+    Ok(())
 }
 
 ////////////////////////////////////////////////////////////////////////////////

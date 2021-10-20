@@ -6,20 +6,21 @@ use tracing::{self, debug};
 /// Table of Contents
 ///
 ///     LoC Description
-///   19-69 Setup Streams for HTTP GET
-///  70-109 Start Server and Client
-/// 110-152 Criterion Setup
-/// 153-187 Utility Code
-/// 188-305 Server Code
+///   16-38 Parameters
+///   38-92 Setup concurrent and parallel HTTP GET
+///  93-153 Start Server and Client
+/// 154-185 Utility Code
+/// 186-351 Server Code
 ///
 
+// A `ulimit -Sn 512` should trigger a hang with these parameters
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
         let nrequests = 1_000_000;
         let cpus = num_cpus::get();           // 2 on initial dev system
-        let nclients = cpus * 20;             // Clients to start (parallelism)
-        let concurrency = 128;                // Concurrent requests
-        let nservers = cpus * 20;             // Servers to start
+        let nclients = cpus;                  // Clients to start (parallelism)
+        let concurrency = 10;                 // Concurrent requests
+        let nservers = cpus;                  // Servers to start
         let nstreamed = nrequests / nclients; // Requests per client
         Client {
             addresses: vec![],
@@ -35,7 +36,7 @@ impl<T: 'static> Default for Client<T> {
     }
 }
 
-/// Setup Streams for HTTP GET
+/// Setup concurrent and parallel HTTP GET
 ///
 /// Invoke client to get URL, return a stream of response durations.
 /// Allocate each client `get` to one of the servers started.
@@ -61,7 +62,7 @@ async fn make_stream<'client>(
 
     urls.map(|url| async move { client.session.get(url) })
         .collect::<futures::stream::futures_unordered::FuturesUnordered<_>>()
-        .buffer_unordered(128)
+        .buffer_unordered(client.concurrency)
         .collect::<Vec<_>>()
         .await
 }
@@ -118,7 +119,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .try_init()
-        .expect("Tracing subscriber in benchmark");
+        .expect("Tracing subscriber in mre");
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut client = Client::<String>::new();
     let mut servers = vec![];
@@ -140,7 +141,7 @@ fn main() {
     let tokio_executor = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(120)
-        .thread_name("calibrate-limit")
+        .thread_name("mre-client-hangs")
         .thread_stack_size(4 * 1024 * 1024)
         .build()
         .unwrap();

@@ -1,7 +1,59 @@
 # Issue: Reproducible Hyper Client Hang
 
-This benchmark demonstrates a reproducible hang in Hyper client.
+This demonstrates a reproducible hang in the Hyper client.
 To see if the default settings reproduce a hang on your system:
+
+| Setting       | MRE | MRE-OK |
+|---------------+-----+--------|
+| `nrequests`   | 1M  | 1M     |
+| `nclients`    | 40  | 10     |
+| `nservers`    | 40  | 10     |
+| `concurrency` | 128 | 128    |
+
+## Setup
+
+**Build the example first.**
+
+Leave 3GB (approx) of system memory free:
+
+```bash
+# swapoff -a
+$ MA=$(cat /proc/meminfo|awk '/MemAvailable/{printf "%d\n", $2;}')
+$ MA=4145972
+$ G1="$((3 * 1024 * 1024))"
+$ MU="$((MA-G1))"
+$ MU="$((1 * 1024 * 1024))"
+$ dd if=/dev/zero bs=1024 |pv -b -B 1024 | dd of=/dev/shm/fill bs=1024 count=$MU
+# swapon -a
+```
+
+Setup Jaeger to parse the tracing logs (you can use `docker` in place of `podman`):
+
+```bash
+podman run \
+      --publish 5778:5778 \
+      --publish 6831:6831/udp \
+      --publish 6832:6832/udp \
+      --publish 14268:14268 \
+      --publish 14250:14250 \
+      --publish 16685:16685 \
+      --publish 16686:16686 \
+      jaegertracing/all-in-one:1.27.0
+podman run \
+      --publish 9411:9411 \
+      openzipkin/zipkin
+```
+
+Now build and run the tracing example:
+
+```bash
+RUST_BACKTRACE=1 RUST_LOG=trace HYPER=trace cargo run --example mre-tracing -Z unstable-options --profile dev -- --nocapture &> mre-tracing.log
+```
+
+## Debugging
+
+The purpose of this repo, and the `hyper` branch in particular is to support
+debugging and identifying the root cause of the hang behavior.
 
 ## Release Test
 
@@ -44,6 +96,19 @@ xzcat --ignore-check /tmp/mre-release-strace.log.xz >/tmp/mre-release-strace.log
 
 For `dev` builds with/without `HYPER=trace` and `RUST_LOG=trace` sizes and runtimes
 increase substantially.
+
+## Code Structure (MRE ToC)
+
+```rust
+/// Table of Contents
+///
+///     LoC Description
+///   16-38 Parameters
+///   38-92 Setup concurrent and parallel HTTP GET
+///  93-153 Start Server and Client
+/// 154-185 Utility Code
+/// 186-351 Server Code
+```
 
 ## Overview
 
