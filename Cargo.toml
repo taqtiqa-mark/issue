@@ -41,3 +41,6 @@ tracing = "0.1.26"
 tracing-futures = "0.2.4"
 tracing-subscriber = "0.2.20"
 tracing-opentelemetry = "0.15.0"
+
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
