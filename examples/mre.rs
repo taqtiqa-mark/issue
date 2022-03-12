@@ -17,10 +17,10 @@ use tracing::{self, debug};
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
         let nrequests = 1_000_000;
-        let cpus = num_cpus::get();           // 2 on initial dev system
-        let nclients = cpus;                  // Clients to start (parallelism)
-        let concurrency = 10;                 // Concurrent requests
-        let nservers = cpus;                  // Servers to start
+        let cpus = num_cpus::get(); // 2 on initial dev system
+        let nclients = 40; // Clients to start (parallelism)
+        let concurrency = 128; // Concurrent requests
+        let nservers = 40; // Servers to start
         let nstreamed = nrequests / nclients; // Requests per client
         Client {
             addresses: vec![],
@@ -48,7 +48,6 @@ impl<T: 'static> Default for Client<T> {
 async fn make_stream<'client>(
     client: &'client Client<String>,
 ) -> std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> {
-
     let it = client
         .addresses
         .iter()
@@ -116,10 +115,6 @@ async fn capacity(client: std::sync::Arc<Client<String>>) {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .try_init()
-        .expect("Tracing subscriber in mre");
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut client = Client::<String>::new();
     let mut servers = vec![];

@@ -1,7 +1,7 @@
 use futures::StreamExt;
 use std::io::{Read, Write};
 use tracing::instrument;
-use tracing::{self, debug, error, info, info_span, span, trace, trace_span, warn,};
+use tracing::{self, debug, error, info, info_span, span, trace, trace_span, warn};
 //use tracing_attributes::instrument;
 use tracing_subscriber::prelude::*;
 
@@ -27,9 +27,9 @@ impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
         let nrequests = 100;
         let cpus = num_cpus::get(); // 2 on initial dev system
-        let nclients = cpus; // Clients to start (parallelism)
-        let concurrency = 10; // Concurrent requests
-        let nservers = cpus; // Servers to start
+        let nclients = 40; // Clients to start (parallelism)
+        let concurrency = 128; // Concurrent requests
+        let nservers = 40; // Servers to start
         let nstreamed = nrequests / nclients; // Requests per client
         Client {
             addresses: vec![],
@@ -53,7 +53,6 @@ impl<T: 'static> Default for Client<T> {
 /// Here, requests are concurrent not parallel.
 /// Async code runs on the caller thread - where parallelism occurs.
 ///
-
 #[tracing::instrument]
 async fn make_stream<'client>(
     client: &'client Client<String>,
@@ -126,6 +125,7 @@ async fn capacity(client: std::sync::Arc<Client<String>>) {
 }
 
 use tracing_subscriber::fmt;
+#[tracing::instrument]
 #[tokio::main]
 async fn main() {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6831));
@@ -134,17 +134,14 @@ async fn main() {
         opentelemetry_jaeger::new_pipeline()
             .with_service_name("mre-jaeger")
             .with_agent_endpoint(addr)
-            .with_tags(vec![
-                opentelemetry::KeyValue::new("exporter", "jaeger"),
-                opentelemetry::KeyValue::new("service.name", "my-service2"),
-                opentelemetry::KeyValue::new("service.namespace", "my-namespace2")
-                ])
-            .with_trace_config(opentelemetry::sdk::trace::config()
-                .with_resource(opentelemetry::sdk::Resource::new(vec![
-                    opentelemetry::KeyValue::new("service.name", "my-service"),
+            .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
+                opentelemetry::sdk::Resource::new(vec![
+                    opentelemetry::KeyValue::new("service.name", "mre"),
                     opentelemetry::KeyValue::new("service.namespace", "my-namespace"),
-            ])))
-            .init_async_exporter(opentelemetry::runtime::Tokio).expect("Jaeger Tokio async exporter"),
+                ]),
+            ))
+            .init_async_exporter(opentelemetry::runtime::Tokio)
+            .expect("Jaeger Tokio async exporter"),
         opentelemetry::runtime::Tokio,
     )
     .build();
@@ -181,9 +178,9 @@ async fn main() {
     let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
 
     tracing_subscriber::registry()
-                        .with(telemetry)
-                        .try_init()
-                        .expect("Global default subscriber.");
+        .with(telemetry)
+        .try_init()
+        .expect("Global default subscriber.");
     // let _ = opentelemetry::global::set_tracer_provider(provider);
 
     // let collector = tracing_subscriber::registry()
@@ -199,7 +196,6 @@ async fn main() {
     //     .with_max_level(tracing::Level::TRACE)
     //     .try_init()
     //     .expect("Tracing subscriber in mre-jaeger");
-
 
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut client = Client::<String>::new();
@@ -226,30 +222,30 @@ async fn main() {
     std::thread::sleep(secs);
     // Trace executed code
     //tracing::subscriber::with_default(subscriber, || async {
-        // Spans will be sent to the configured OpenTelemetry exporter
-        let root = span!(tracing::Level::TRACE, "app_start", work_units = 2);
-        let _enter = root.enter();
-        trace!("some event data here.");
-        let eg = trace_span!("some span data here.").entered();
-        let client = std::sync::Arc::new(client);
-        // let tokio_executor = tokio::runtime::Builder::new_multi_thread()
-        //     .enable_all()
-        //     .worker_threads(120)
-        //     .thread_name("mre-client-hangs")
-        //     .thread_stack_size(4 * 1024 * 1024)
-        //     .build()
-        //     .unwrap();
-        // tokio_executor.block_on(async {
-            //init_tracer().expect("Tracer setup failed");
-            // let tracer = opentelemetry::global::tracer("jaeger-and-zipkin");
+    // Spans will be sent to the configured OpenTelemetry exporter
+    let root = span!(tracing::Level::TRACE, "app_start", work_units = 2);
+    let _enter = root.enter();
+    trace!("some event data here.");
+    let eg = trace_span!("some span data here.").entered();
+    let client = std::sync::Arc::new(client);
+    // let tokio_executor = tokio::runtime::Builder::new_multi_thread()
+    //     .enable_all()
+    //     .worker_threads(120)
+    //     .thread_name("mre-client-hangs")
+    //     .thread_stack_size(4 * 1024 * 1024)
+    //     .build()
+    //     .unwrap();
+    // tokio_executor.block_on(async {
+    //init_tracer().expect("Tracer setup failed");
+    // let tracer = opentelemetry::global::tracer("jaeger-and-zipkin");
 
-            // let span = tracer.start("first span");
-            // let _guard = opentelemetry::trace::mark_span_as_active(span);
-            capacity(client.clone()).await;
+    // let span = tracer.start("first span");
+    // let _guard = opentelemetry::trace::mark_span_as_active(span);
+    capacity(client.clone()).await;
 
-        // });
+    // });
 
-        error!("This event will be logged in the root span.");
+    error!("This event will be logged in the root span.");
     //}).await;
 
     info!("Terminating servers");
@@ -281,6 +277,7 @@ impl Client<String> {
         Default::default()
     }
 
+    #[tracing::instrument]
     fn add_address(&mut self) -> std::string::String {
         let listener = mio::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let address = listener.local_addr().unwrap().to_string();
