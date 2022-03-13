@@ -3,8 +3,8 @@ use std::io::{Read, Write};
 #[cfg(feature = "traceable")]
 use {
     tracing::{self, debug},
-    tracing_futures::Instrument,
     tracing_subscriber::layer::SubscriberExt,
+    tracing_subscriber::prelude::*,
     tracing_subscriber::util::SubscriberInitExt,
     tracing_subscriber::Registry,
 };
@@ -133,40 +133,31 @@ async fn main() {
     {
         // Jaeger instance address
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6831));
-        // Build a Jaeger batch span processor
-        let jaeger_processor = opentelemetry::sdk::trace::BatchSpanProcessor::builder(
-            opentelemetry_jaeger::new_pipeline()
-                .with_service_name("mre-0.2.0")
-                .with_agent_endpoint(addr)
-                .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
-                    opentelemetry::sdk::Resource::new(vec![opentelemetry::KeyValue::new(
-                        "service.namespace",
-                        "ok",
-                    )]),
-                ))
-                .init_async_exporter(opentelemetry::runtime::Tokio)
-                .expect("Jaeger Tokio async exporter"),
-            opentelemetry::runtime::Tokio,
-        )
-        .build();
+        // First create propagators
+        let baggage_propagator = opentelemetry::sdk::propagation::BaggagePropagator::new();
+        let trace_context_propagator =
+            opentelemetry::sdk::propagation::TraceContextPropagator::new();
+        let jaeger_propagator = opentelemetry_jaeger::Propagator::new();
 
-        // Setup Tracer Provider
-        let provider = opentelemetry::sdk::trace::TracerProvider::builder()
-            // We can build a span processor and pass it into provider.
-            .with_span_processor(jaeger_processor)
-            .build();
-
-        // Get new Tracer from TracerProvider
-        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "my_app", None);
-        // Create a layer with the configured tracer
-        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-
-        Registry::default().with(telemetry).init();
+        // Second compose propagators
+        let _composite_propagator =
+            opentelemetry::sdk::propagation::TextMapCompositePropagator::new(vec![
+                Box::new(baggage_propagator),
+                Box::new(trace_context_propagator),
+                Box::new(jaeger_propagator),
+            ]);
+        // Third create Jaeger pipeline
+        let tracer = opentelemetry_jaeger::new_pipeline()
+            .with_service_name("mre-0.4.3")
+            .install_batch(opentelemetry::runtime::Tokio)
+            .unwrap();
+        // Initialize `tracing` using `opentelemetry-tracing` and configure stdout logging
+        tracing_subscriber::Registry::default()
+            .with(tracing_subscriber::EnvFilter::new("TRACE"))
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(tracing_subscriber::fmt::layer())
+            .init();
     }
-
-    #[cfg(feature = "traceable")]
-    // Create a span and enter it, returning a guard....
-    let root_span = tracing::span!(tracing::Level::TRACE, "root_span");
 
     #[cfg(feature = "traceable")]
     debug!("Running on thread {:?}", std::thread::current().id());
@@ -174,11 +165,14 @@ async fn main() {
     let mut servers = vec![];
 
     #[cfg(feature = "traceable")]
-    async {
-        run_servers_clients(client, servers).await;
+    {
+        // Trace executed (async) code. Create a span, returning a guard....
+        let root_span = tracing::span!(tracing::Level::TRACE, "root_span");
+        let traceable = tracing_futures::WithSubscriber::with_current_subscriber(async {
+            run_servers_clients(client, servers).await;
+        });
+        tracing_futures::Instrument::instrument(traceable, root_span).await;
     }
-    .instrument(root_span)
-    .await;
 
     #[cfg(not(feature = "traceable"))]
     run_servers_clients(client, servers).await;
@@ -262,7 +256,7 @@ impl Client<String> {
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
 Connection: keep-alive
-Content-Length: 13
+Content-Length: 14
 
 Hello, World!
 ";
