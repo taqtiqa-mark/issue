@@ -175,12 +175,12 @@ podman run -p6831:6831/udp -p6832:6832/udp -p16686:16686 -p14268:14268 jaegertra
 In a second console:
 
 ```bash
-OTEL_BSP_MAX_EXPORT_BATCH_SIZE=128 cargo run --example mre --profile release --features "ok, traceable"  -- --nocapture &> mre-ok-traceable.log
+OTEL_BSP_MAX_EXPORT_BATCH_SIZE=64 cargo run --example mre --profile release --features=ok,traceable  -- --nocapture &> mre-ok-traceable.log
 ```
 
 ## Hanging behavior
 
-Hang bahavior 
+Hang bahavior
 ### Traceable - Jaeger
 
 Startup the Jaeger server:
