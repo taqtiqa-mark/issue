@@ -1,7 +1,13 @@
 use futures::StreamExt;
 use std::io::{Read, Write};
-use tracing::instrument;
-use tracing::{self, debug};
+#[cfg(feature = "traceable")]
+use {
+    tracing::{self, debug},
+    tracing_futures::Instrument,
+    tracing_subscriber::layer::SubscriberExt,
+    tracing_subscriber::util::SubscriberInitExt,
+    tracing_subscriber::Registry,
+};
 
 /// Table of Contents
 ///
@@ -16,11 +22,17 @@ use tracing::{self, debug};
 // A `ulimit -Sn 512` should trigger a hang with these parameters
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
-        let nrequests = 1_000_000;
+        let nrequests = 750;
         let cpus = num_cpus::get(); // 2 on initial dev system
+        #[cfg(feature = "ok")]
+        let nclients = 5; // Clients to start (parallelism)
+        #[cfg(feature = "hang")]
         let nclients = 40; // Clients to start (parallelism)
         let concurrency = 128; // Concurrent requests
-        let nservers = 40; // Servers to start
+        #[cfg(feature = "ok")]
+        let nservers = 5; // Servers to start (parallelism)
+        #[cfg(feature = "hang")]
+        let nservers = 5; // Servers to start (parallelism)
         let nstreamed = nrequests / nclients; // Requests per client
         Client {
             addresses: vec![],
@@ -44,7 +56,7 @@ impl<T: 'static> Default for Client<T> {
 /// Here, requests are concurrent not parallel.
 /// Async code runs on the caller thread - where parallelism occurs.
 ///
-#[instrument]
+#[cfg_attr(feature = "traceable", tracing::instrument(skip(client)))]
 async fn make_stream<'client>(
     client: &'client Client<String>,
 ) -> std::vec::Vec<Result<hyper::Response<hyper::Body>, hyper::Error>> {
@@ -66,7 +78,7 @@ async fn make_stream<'client>(
         .await
 }
 
-#[instrument]
+#[cfg_attr(feature = "traceable", tracing::instrument(skip(client)))]
 async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> std::vec::Vec<hyper::Body> {
     println!("Run Stream. Thread: {:?}", std::thread::current().id());
 
@@ -82,6 +94,7 @@ async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> std::vec
         .await
 }
 
+#[cfg_attr(feature = "traceable", tracing::instrument(skip(result)))]
 async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -> hyper::Body {
     match result {
         Ok(r) => r.into_body(),
@@ -95,7 +108,7 @@ async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -
 //
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 //
-#[instrument]
+#[cfg_attr(feature = "traceable", tracing::instrument(skip(client)))]
 async fn capacity(client: std::sync::Arc<Client<String>>) {
     let clients = vec![client.clone(); client.nclients];
     let mut handles = vec![];
@@ -114,10 +127,83 @@ async fn capacity(client: std::sync::Arc<Client<String>>) {
     );
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    #[cfg(feature = "traceable")]
+    {
+        // Jaeger instance address
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6831));
+        // Build a Jaeger batch span processor
+        let jaeger_processor = opentelemetry::sdk::trace::BatchSpanProcessor::builder(
+            opentelemetry_jaeger::new_pipeline()
+                .with_service_name("mre-0.2.0")
+                .with_agent_endpoint(addr)
+                .with_trace_config(opentelemetry::sdk::trace::config().with_resource(
+                    opentelemetry::sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+                        "service.namespace",
+                        "ok",
+                    )]),
+                ))
+                .init_async_exporter(opentelemetry::runtime::Tokio)
+                .expect("Jaeger Tokio async exporter"),
+            opentelemetry::runtime::Tokio,
+        )
+        .build();
+
+        // Setup Tracer Provider
+        let provider = opentelemetry::sdk::trace::TracerProvider::builder()
+            // We can build a span processor and pass it into provider.
+            .with_span_processor(jaeger_processor)
+            .build();
+
+        // Get new Tracer from TracerProvider
+        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "my_app", None);
+        // Create a layer with the configured tracer
+        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+
+        Registry::default().with(telemetry).init();
+    }
+
+    #[cfg(feature = "traceable")]
+    // Create a span and enter it, returning a guard....
+    let root_span = tracing::span!(tracing::Level::TRACE, "root_span");
+
+    #[cfg(feature = "traceable")]
     debug!("Running on thread {:?}", std::thread::current().id());
     let mut client = Client::<String>::new();
     let mut servers = vec![];
+
+    #[cfg(feature = "traceable")]
+    async {
+        run_servers_clients(client, servers).await;
+    }
+    .instrument(root_span)
+    .await;
+
+    #[cfg(not(feature = "traceable"))]
+    run_servers_clients(client, servers).await;
+
+    #[cfg(feature = "traceable")]
+    // Send remaining spans
+    opentelemetry::global::shutdown_tracer_provider();
+}
+
+async fn run_servers_clients(
+    mut client: Client<String>,
+    mut servers: Vec<std::sync::mpsc::Sender<Msg>>,
+) {
+    setup_servers(&mut client, &mut servers);
+    let secs = std::time::Duration::from_millis(2000);
+    std::thread::sleep(secs);
+    let client = std::sync::Arc::new(client);
+    capacity(client.clone()).await;
+    println!("Terminating servers");
+    for s in servers.iter() {
+        s.send(Msg::Stop).unwrap();
+    }
+}
+
+fn setup_servers(client: &mut Client<String>, servers: &mut Vec<std::sync::mpsc::Sender<Msg>>) {
     println!("Initializing servers");
     for _ in 0..client.nservers {
         let address = client.add_address();
@@ -125,25 +211,12 @@ fn main() {
         servers.push(spawn_server(address));
         if let Some(server) = servers.last() {
             server.send(Msg::Start).unwrap();
+            #[cfg(feature = "traceable")]
             debug!("    - The server WAS spawned!");
         } else {
+            #[cfg(feature = "traceable")]
             debug!("    - The server was NOT spawned!");
         };
-    }
-    let secs = std::time::Duration::from_millis(2000);
-    std::thread::sleep(secs);
-    let client = std::sync::Arc::new(client);
-    let tokio_executor = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(120)
-        .thread_name("mre-client-hangs")
-        .thread_stack_size(4 * 1024 * 1024)
-        .build()
-        .unwrap();
-    tokio_executor.block_on(async { capacity(client.clone()).await });
-    println!("Terminating servers");
-    for s in servers.iter() {
-        s.send(Msg::Stop).unwrap();
     }
 }
 
@@ -173,6 +246,7 @@ impl Client<String> {
         let address = listener.local_addr().unwrap().to_string();
         let mut url: String = "".to_owned();
         url.push_str(&address);
+        #[cfg(feature = "traceable")]
         debug!("Added address: {}", address);
         self.addresses.push(url.clone());
         url
@@ -190,9 +264,10 @@ Content-Type: text/html
 Connection: keep-alive
 Content-Length: 13
 
-Hello World!
+Hello, World!
 ";
 
+// Consider replacing with byte literals, e.g.  b'\r', etc.
 fn is_double_crnl(window: &[u8]) -> bool {
     window.len() >= 4
         && (window[0] == '\r' as u8)
@@ -211,22 +286,27 @@ enum Msg {
     Stop,
 }
 
+#[cfg_attr(feature = "traceable", tracing::instrument)]
 fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         while let Ok(msg) = &rx.recv() {
             match msg {
                 Msg::Start => {
+                    #[cfg(feature = "traceable")]
                     debug!("    - The server should start.");
                     init_mio_server(address.clone());
+                    #[cfg(feature = "traceable")]
                     debug!("      - The server has started.");
                 }
                 Msg::Stop => {
+                    #[cfg(feature = "traceable")]
                     debug!("    - The server should stop.");
                     return;
                 }
             }
         }
+        #[cfg(feature = "traceable")]
         debug!("The server has stopped!");
     });
     tx
@@ -235,7 +315,9 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
 // We need a server that eliminates Hyper server code as an explanation.
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
+#[cfg_attr(feature = "traceable", tracing::instrument)]
 fn init_mio_server(address: std::string::String) {
+    #[cfg(feature = "traceable")]
     debug!("Server: {}", address);
     let mut listener =
         reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to address");
@@ -333,6 +415,7 @@ fn init_mio_server(address: std::string::String) {
 }
 
 // Make server startup robust to existing listener on the same address.
+#[cfg_attr(feature = "traceable", tracing::instrument)]
 fn reuse_mio_listener(
     addr: &std::net::SocketAddr,
 ) -> Result<mio::net::TcpListener, std::convert::Infallible> {

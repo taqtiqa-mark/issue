@@ -146,38 +146,53 @@ Example:
 
 ## Baseline: Correct behavior
 
-The example `mre-ok.rs` illustrates expected behavior, and can be useful in
+The example `mre.rs` illustrates expected behavior, and can be useful in
 establishing a baseline, e.g. relative numbers of function calls, etc.
 
 ```bash
-$ cargo run --example mre-ok -Z unstable-options --profile release -- --nocapture &> mre-ok-notrace.log
+$ cargo run --example mre --profile release --features "ok" -- --nocapture &> mre-ok.log
    Compiling mre v0.2.0 (/home/hedge/src/issue)
     Finished release [optimized] target(s) in 1m 23s
      Running `target/release/examples/mre-ok --nocapture`
 Initializing servers
   - Added address: 127.0.0.1:24777
-  - Added address: 127.0.0.1:15393
-  - Added address: 127.0.0.1:25073
-  - Added address: 127.0.0.1:36457
-  - Added address: 127.0.0.1:17921
-  - Added address: 127.0.0.1:32145
-  - Added address: 127.0.0.1:28547
-  - Added address: 127.0.0.1:19611
-  - Added address: 127.0.0.1:20227
-  - Added address: 127.0.0.1:23647
+  ....
 Awaiting clients
 Run Stream. Thread: ThreadId(88)
-Run Stream. Thread: ThreadId(26)
-Run Stream. Thread: ThreadId(89)
-Run Stream. Thread: ThreadId(55)
-Run Stream. Thread: ThreadId(90)
-Run Stream. Thread: ThreadId(56)
-Run Stream. Thread: ThreadId(91)
-Run Stream. Thread: ThreadId(57)
-Run Stream. Thread: ThreadId(92)
-Run Stream. Thread: ThreadId(15)
+...
 Throughput: 36489.9 request/s [1000000 in 54809630]
 Terminating servers
+```
+
+### Traceable - Jaeger
+
+Startup the Jaeger server:
+
+```bash
+podman run -p6831:6831/udp -p6832:6832/udp -p16686:16686 -p14268:14268 jaegertracing/all-in-one:latest
+```
+
+In a second console:
+
+```bash
+OTEL_BSP_MAX_EXPORT_BATCH_SIZE=128 cargo run --example mre --profile release --features "ok, traceable"  -- --nocapture &> mre-ok-traceable.log
+```
+
+## Hanging behavior
+
+Hang bahavior 
+### Traceable - Jaeger
+
+Startup the Jaeger server:
+
+```bash
+podman run -p6831:6831/udp -p6832:6832/udp -p16686:16686 -p14268:14268 jaegertracing/all-in-one:latest
+```
+
+In a second console:
+
+```bash
+OTEL_BSP_MAX_EXPORT_BATCH_SIZE=128 cargo run --example mre --profile release --features "ok, traceable"  -- --nocapture &> mre-ok-traceable.log
 ```
 
 ## Observations

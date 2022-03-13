@@ -1,6 +1,6 @@
 [package]
 name = "mre"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2018"
 
 [dependencies]
@@ -31,16 +31,30 @@ tokio = { version = "^1.8", features = [
 tokio-stream = "0.1"
 url = "2.2"
 uuid = { version = "0.8", features = ["serde", "v4", "v5"] }
+# Tracing dependencies
+opentelemetry = { version = "0.16.0", features = ["rt-tokio", "trace"], optional = true }
+opentelemetry-jaeger = { version = "0.15.0", features = ["surf_collector_client","rt-tokio"], optional = true }
+surf = { version = "2.3.1", features = ["h1-client"], optional = true }
+tracing = { version = "0.1.26", optional = true }
+tracing-futures = { version = "0.2.4", optional = true }
+tracing-opentelemetry = { version = "0.15.0", optional = true }
+tracing-subscriber = { version = "0.2.20", optional = true }
+tracing-tree = { version = "0.2.0", optional = true }
 
-[dev-dependencies]
-opentelemetry = { version = "0.16.0", features = ["rt-tokio", "trace"] }
-opentelemetry-jaeger = { version = "0.15.0", features = ["surf_collector_client","rt-tokio"] }
-opentelemetry-zipkin = { version = "0.14.0", features=["surf-client"], default-features = false }
-surf = {version = "2.3.1", features = ["h1-client"] }
-tracing = "0.1.26"
-tracing-futures = "0.2.4"
-tracing-subscriber = "0.2.20"
-tracing-opentelemetry = "0.15.0"
+[features]
+default = []
+hang = []
+ok = []
+traceable = [
+  "opentelemetry",
+  "opentelemetry-jaeger",
+  "surf",
+  "tracing",
+  "tracing-futures",
+  "tracing-opentelemetry",
+  "tracing-subscriber",
+  "tracing-tree"
+]
 
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
