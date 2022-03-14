@@ -35,7 +35,7 @@ use {
 // A `ulimit -Sn 512` should trigger a hang with these parameters
 impl<T: 'static> Default for Client<T> {
     fn default() -> Self {
-        let nrequests = 1_000_000;
+        let nrequests = 750;
         let cpus = num_cpus::get(); // 2 on initial dev system
         #[cfg(feature = "ok")]
         let nclients = 5; // Clients to start (parallelism)
@@ -141,7 +141,7 @@ async fn capacity(client: std::sync::Arc<Client<String>>) {
 fn init_tracer() -> Result<opentelemetry::sdk::trace::Tracer, TraceError> {
     // tracing_subscriber::fmt::init();
     opentelemetry_jaeger::new_pipeline()
-        .with_service_name("mre-0.4.7")
+        .with_service_name("mre-0.4.13")
         .with_trace_config(trace::config().with_sampler(Sampler::AlwaysOn))
         // .with_trace_config(Config::default().with_resource(Resource::new(vec![
         //     KeyValue::new("service.name", "mre-0.4.7"),
@@ -169,50 +169,59 @@ fn init_meter() -> PushController {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    // By binding the result to an unused variable, the lifetime of the variable
-    // matches the containing block, reporting traces and metrics during the whole
-    // execution.
     #[cfg(feature = "traceable")]
-    let tracer = init_tracer()?;
-    // #[cfg(feature = "traceable")]
-    // let _started = init_meter();
+    {
+        // Jaeger instance address
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6831));
+        // First create propagators
+        let baggage_propagator = opentelemetry::sdk::propagation::BaggagePropagator::new();
+        let trace_context_propagator =
+            opentelemetry::sdk::propagation::TraceContextPropagator::new();
+        let jaeger_propagator = opentelemetry_jaeger::Propagator::new();
 
-    // #[cfg(feature = "traceable")]
-    //let tracer = global::tracer("ex.com/basic");
-    // #[cfg(feature = "traceable")]
-    // let meter = global::meter("ex.com/basic");
-
-    // Use the tracing subscriber `Registry`, or any other subscriber
-    // that impls `LookupSpan`
-    #[cfg(feature = "traceable")]
-    Registry::default()
-        .with(tracing_subscriber::EnvFilter::new("TRACE"))
-        .with(tracing_opentelemetry::OpenTelemetryLayer::new(tracer))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+        // Second compose propagators
+        let _composite_propagator =
+            opentelemetry::sdk::propagation::TextMapCompositePropagator::new(vec![
+                Box::new(baggage_propagator),
+                Box::new(trace_context_propagator),
+                Box::new(jaeger_propagator),
+            ]);
+        // Third create Jaeger pipeline
+        let tracer = opentelemetry_jaeger::new_pipeline()
+            .with_service_name("mre-0.4.13")
+            // .with_trace_config(opentelemetry::sdk::trace::Config::default().with_sampler(
+            //     opentelemetry::sdk::trace::Sampler::ParentBased(Box::new(
+            //         opentelemetry::sdk::trace::Sampler::TraceIdRatioBased(1.25),
+            //     )),
+            // ))
+            // .with_trace_config(
+            //     opentelemetry::sdk::trace::Config::default()
+            //         .with_sampler(opentelemetry::sdk::trace::Sampler::AlwaysOn),
+            // )
+            // .install_batch(opentelemetry::runtime::Tokio)
+            .install_simple()
+            .unwrap();
+        // Initialize `tracing` using `opentelemetry-tracing` and configure stdout logging
+        tracing_subscriber::Registry::default()
+            .with(tracing_subscriber::EnvFilter::new("TRACE"))
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 
     #[cfg(feature = "traceable")]
     debug!("Running on thread {:?}", std::thread::current().id());
-    let client = Client::<String>::new();
-    let servers = vec![];
+    let mut client = Client::<String>::new();
+    let mut servers = vec![];
 
     #[cfg(feature = "traceable")]
     {
         // Trace executed (async) code. Create a span, returning a guard....
-        // tracer.in_span("operation", |cx| {
-        //     let root_span = cx.span();
-        let client_server_span =
-            tracing::span!(target: "app_spans",tracing::Level::TRACE, "client-server-span");
-        tracing_futures::Instrument::instrument(
-            async {
-                run_servers_clients(client, servers).await;
-            },
-            client_server_span,
-        );
-        // });
-        // let root_span = tracing::span!(tracing::Level::TRACE, "root_span");
-        // tracing_futures::Instrument::instrument(run_servers_clients(client, servers), root_span)
-        //     .await;
+        let root_span = tracing::span!(tracing::Level::TRACE, "root_span");
+        let traceable = tracing_futures::WithSubscriber::with_current_subscriber(async {
+            run_servers_clients(client, servers).await;
+        });
+        tracing_futures::Instrument::instrument(traceable, root_span).await;
     }
 
     #[cfg(not(feature = "traceable"))]
