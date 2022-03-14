@@ -32,7 +32,7 @@ impl<T: 'static> Default for Client<T> {
         #[cfg(feature = "ok")]
         let nservers = 5; // Servers to start (parallelism)
         #[cfg(feature = "hang")]
-        let nservers = 5; // Servers to start (parallelism)
+        let nservers = 40; // Servers to start (parallelism)
         let nstreamed = nrequests / nclients; // Requests per client
         Client {
             addresses: vec![],
@@ -147,7 +147,7 @@ async fn main() {
             ]);
         // Third create Jaeger pipeline
         let tracer = opentelemetry_jaeger::new_pipeline()
-            .with_service_name("mre-0.3.6")
+            .with_service_name("mre-hang-0.1.0")
             .install_batch(opentelemetry::runtime::Tokio)
             .unwrap();
         // Initialize `tracing` using `opentelemetry-tracing` and configure stdout logging
@@ -164,13 +164,10 @@ async fn main() {
 
     // Trace executed (async) code. Create a span, returning a guard....
     let root_span = tracing::span!(tracing::Level::TRACE, "root_span");
-    tracing_futures::Instrument::instrument(
-        async {
-            run_servers_clients(client, servers).await;
-        },
-        root_span,
-    )
-    .await;
+    let traceable = tracing_futures::WithSubscriber::with_current_subscriber(async {
+        run_servers_clients(client, servers).await;
+    });
+    tracing_futures::Instrument::instrument(traceable, root_span).await;
 
     // #[cfg(not(feature = "traceable"))]
     // run_servers_clients(client, servers).await;
@@ -185,8 +182,8 @@ async fn run_servers_clients(
     mut servers: Vec<std::sync::mpsc::Sender<Msg>>,
 ) {
     setup_servers(&mut client, &mut servers);
-    let secs = std::time::Duration::from_millis(2000);
-    std::thread::sleep(secs);
+    // let secs = std::time::Duration::from_millis(2000);
+    // std::thread::sleep(secs);
     let client = std::sync::Arc::new(client);
     capacity(client.clone()).await;
     println!("Terminating servers");
