@@ -32,31 +32,22 @@ tokio-stream = "0.1"
 url = "2.2"
 uuid = { version = "0.8", features = ["serde", "v4", "v5"] }
 # Tracing dependencies
-opentelemetry = { version = "0.17.0", features = ["rt-tokio", "trace", "metrics", "serialize"], optional = true }
-opentelemetry-jaeger = { version = "0.16.0", features = ["surf_collector_client", "rt-tokio"], optional = true }
-serde_json = { version = "1.0", optional = true }
-surf = { version = "2.3.1", features = ["h1-client"], optional = true }
-tracing = { version = "0.1.26", optional = true }
-tracing-futures = { version = "0.2.4", optional = true }
-tracing-opentelemetry = { version = "0.17.2", optional = true }
-tracing-subscriber = { version = "0.3.9", features = ["env-filter", "json"], optional = true }
-tracing-tree = { version = "0.2.0", optional = true }
+minitrace = { version = "0.4.0", optional = true }
+minitrace-jaeger = { version = "0.4.0", optional = true }
+rand = { version = "0.8.0", optional = true }
 
 [features]
 default = []
 hang = []
 ok = []
 traceable = [
-  "opentelemetry",
-  "opentelemetry-jaeger",
-  "serde_json",
-  "surf",
-  "tracing",
-  "tracing-futures",
-  "tracing-opentelemetry",
-  "tracing-subscriber",
-  "tracing-tree"
+  "minitrace",
+  "minitrace-jaeger",
+  "rand"
 ]
+
+[patch.crates-io]
+minitrace-macro = { path = "./../minitrace-rust/minitrace-macro" }
 
 [build]
 rustflags = ["--cfg", "tokio_unstable"]

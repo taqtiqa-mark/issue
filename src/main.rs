@@ -1,26 +1,7 @@
 use futures::StreamExt;
-use std::io::{Read, Write};
 #[cfg(feature = "traceable")]
-use {
-    opentelemetry::global,
-    opentelemetry::global::shutdown_tracer_provider,
-    opentelemetry::sdk::trace::Config,
-    opentelemetry::sdk::{
-        metrics::PushController,
-        trace::{self, Sampler},
-        Resource,
-    },
-    opentelemetry::trace::TraceError,
-    opentelemetry::{
-        baggage::BaggageExt,
-        metrics::{MetricsError, ObserverResult},
-        trace::{TraceContextExt, Tracer},
-        Context, Key, KeyValue,
-    },
-    tracing::{self, debug},
-    tracing_subscriber::prelude::*,
-    tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry},
-};
+use minitrace::prelude::*;
+use std::io::{Read, Write};
 
 /// Table of Contents
 ///
@@ -69,7 +50,11 @@ impl<T: 'static> Default for Client<T> {
 /// Here, requests are concurrent not parallel.
 /// Async code runs on the caller thread - where parallelism occurs.
 ///
-#[cfg_attr(feature = "traceable", tracing::instrument)]
+
+#[cfg_attr(
+    feature = "traceable",
+    minitrace::trace("make-stream", enter_on_poll = true)
+)]
 async fn make_stream<'client>(client: &'client Client<String>) -> std::vec::Vec<hyper::Body> {
     let it = client
         .addresses
@@ -95,16 +80,22 @@ async fn make_stream<'client>(client: &'client Client<String>) -> std::vec::Vec<
         .await
 }
 
-#[cfg_attr(feature = "traceable", tracing::instrument)]
+// #[cfg_attr(
+//     feature = "traceable",
+//     minitrace::trace("run-stream", enter_on_poll = true)
+// )]
 async fn run_stream<'client>(client: std::sync::Arc<Client<String>>) -> std::vec::Vec<hyper::Body> {
-    #[cfg(feature = "traceable")]
-    debug!("Run Stream. Thread: {:?}", std::thread::current().id());
-
+    // #[cfg(feature = "traceable")]
+    // debug!("Run Stream. Thread: {:?}", std::thread::current().id());
+    tokio::task::yield_now().await;
     let client = client.as_ref();
     make_stream(client).await
 }
 
-#[cfg_attr(feature = "traceable", tracing::instrument(skip(result)))]
+#[cfg_attr(
+    feature = "traceable",
+    minitrace::trace("read-body", enter_on_poll = true)
+)]
 async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -> hyper::Body {
     match result {
         Ok(r) => r.into_body(),
@@ -112,22 +103,31 @@ async fn read_body(result: Result<hyper::Response<hyper::Body>, hyper::Error>) -
     }
 }
 
+fn build_streams(
+    client: std::sync::Arc<Client<String>>,
+) -> std::vec::Vec<tokio::task::JoinHandle<std::vec::Vec<hyper::Body>>> {
+    let clients = vec![client.clone(); client.nclients];
+    let mut handles = vec![];
+    for c in clients.into_iter() {
+        handles.push(tokio::spawn(run_stream(c)))
+    }
+    handles
+}
 ////////////////////////////////////////////////////////////////////////////////
 //
 // Start Server and Client
 //
 // Start HTTP Server, Setup the HTTP client and Run the Stream
 //
-#[cfg_attr(feature = "traceable", tracing::instrument)]
+#[cfg_attr(
+    feature = "traceable",
+    minitrace::trace("capacity", enter_on_poll = true)
+)]
 async fn capacity(client: std::sync::Arc<Client<String>>) {
-    let clients = vec![client.clone(); client.nclients];
-    let mut handles = vec![];
-    for c in clients.into_iter() {
-        handles.push(tokio::spawn(run_stream(c)))
-    }
+    let handles = build_streams(client.clone());
     let benchmark_start = tokio::time::Instant::now();
-    #[cfg(feature = "traceable")]
-    debug!("Awaiting clients");
+    // #[cfg(feature = "traceable")]
+    // debug!("Awaiting clients");
     futures::future::join_all(handles).await;
     let elapsed = benchmark_start.elapsed().as_micros() as f64;
     println!(
@@ -138,105 +138,49 @@ async fn capacity(client: std::sync::Arc<Client<String>>) {
     );
 }
 
-fn init_tracer() -> Result<opentelemetry::sdk::trace::Tracer, TraceError> {
-    // tracing_subscriber::fmt::init();
-    opentelemetry_jaeger::new_pipeline()
-        .with_service_name("mre-0.4.13")
-        .with_trace_config(trace::config().with_sampler(Sampler::AlwaysOn))
-        // .with_trace_config(Config::default().with_resource(Resource::new(vec![
-        //     KeyValue::new("service.name", "mre-0.4.7"),
-        //     KeyValue::new("exporter", "otel-jaeger"),
-        // ])))
-        .install_batch(opentelemetry::runtime::Tokio)
-}
-
-// Skip first immediate tick from tokio, not needed for async_std.
-fn delayed_interval(
-    duration: std::time::Duration,
-) -> impl futures::stream::Stream<Item = tokio::time::Instant> {
-    opentelemetry::util::tokio_interval_stream(duration).skip(1)
-}
-
-fn init_meter() -> PushController {
-    opentelemetry::sdk::export::metrics::stdout(tokio::spawn, delayed_interval)
-        .with_formatter(|batch| {
-            serde_json::to_value(batch)
-                .map(|value| value.to_string())
-                .map_err(|err| MetricsError::Other(err.to_string()))
-        })
-        .init()
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     #[cfg(feature = "traceable")]
-    {
-        // Jaeger instance address
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 6831));
-        // First create propagators
-        let baggage_propagator = opentelemetry::sdk::propagation::BaggagePropagator::new();
-        let trace_context_propagator =
-            opentelemetry::sdk::propagation::TraceContextPropagator::new();
-        let jaeger_propagator = opentelemetry_jaeger::Propagator::new();
+    let (span, collector) = minitrace::Span::root("root");
 
-        // Second compose propagators
-        let _composite_propagator =
-            opentelemetry::sdk::propagation::TextMapCompositePropagator::new(vec![
-                Box::new(baggage_propagator),
-                Box::new(trace_context_propagator),
-                Box::new(jaeger_propagator),
-            ]);
-        // Third create Jaeger pipeline
-        let tracer = opentelemetry_jaeger::new_pipeline()
-            .with_service_name("mre-0.4.13")
-            // .with_trace_config(opentelemetry::sdk::trace::Config::default().with_sampler(
-            //     opentelemetry::sdk::trace::Sampler::ParentBased(Box::new(
-            //         opentelemetry::sdk::trace::Sampler::TraceIdRatioBased(1.25),
-            //     )),
-            // ))
-            // .with_trace_config(
-            //     opentelemetry::sdk::trace::Config::default()
-            //         .with_sampler(opentelemetry::sdk::trace::Sampler::AlwaysOn),
-            // )
-            // .install_batch(opentelemetry::runtime::Tokio)
-            .install_simple()
-            .unwrap();
-        // Initialize `tracing` using `opentelemetry-tracing` and configure stdout logging
-        tracing_subscriber::Registry::default()
-            .with(tracing_subscriber::EnvFilter::new("TRACE"))
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-            .with(tracing_subscriber::fmt::layer())
-            .init();
-    }
-
-    #[cfg(feature = "traceable")]
-    debug!("Running on thread {:?}", std::thread::current().id());
+    // #[cfg(feature = "traceable")]
+    // debug!("Running on thread {:?}", std::thread::current().id());
     let mut client = Client::<String>::new();
     let mut servers = vec![];
 
     #[cfg(feature = "traceable")]
     {
-        // Trace executed (async) code. Create a span, returning a guard....
-        let root_span = tracing::span!(tracing::Level::TRACE, "root_span");
-        let traceable = tracing_futures::WithSubscriber::with_current_subscriber(async {
+        let f = async {
             run_servers_clients(client, servers).await;
-        });
-        tracing_futures::Instrument::instrument(traceable, root_span).await;
+        };
+        tokio::spawn(f.in_span(span)).await.unwrap();
     }
 
     #[cfg(not(feature = "traceable"))]
     run_servers_clients(client, servers).await;
 
     #[cfg(feature = "traceable")]
-    // Send remaining spans
-    opentelemetry::global::shutdown_tracer_provider();
+    {
+        // Send remaining spans
+        let spans = collector.collect().await;
+        // Report to Jaeger
+        let bytes =
+            minitrace_jaeger::encode("mre-0.6.4".to_owned(), rand::random(), 0, 0, &spans).unwrap();
+        minitrace_jaeger::report("127.0.0.1:6831".parse().unwrap(), &bytes)
+            .await
+            .ok();
+    }
     Ok(())
 }
 
-async fn run_servers_clients(
-    mut client: Client<String>,
-    mut servers: Vec<std::sync::mpsc::Sender<Msg>>,
-) {
+///
+#[cfg_attr(
+    feature = "traceable",
+    minitrace::trace("run-servers-clients", enter_on_poll = true)
+)]
+async fn run_servers_clients(client: Client<String>, servers: Vec<std::sync::mpsc::Sender<Msg>>) {
+    let mut client = client;
+    let mut servers = servers;
     setup_servers(&mut client, &mut servers);
     // let secs = std::time::Duration::from_millis(2000);
     // std::thread::sleep(secs);
@@ -248,6 +192,7 @@ async fn run_servers_clients(
     }
 }
 
+#[cfg_attr(feature = "traceable", minitrace::trace("setup-servers"))]
 fn setup_servers(client: &mut Client<String>, servers: &mut Vec<std::sync::mpsc::Sender<Msg>>) {
     println!("Initializing servers");
     for _ in 0..client.nservers {
@@ -256,11 +201,11 @@ fn setup_servers(client: &mut Client<String>, servers: &mut Vec<std::sync::mpsc:
         servers.push(spawn_server(address));
         if let Some(server) = servers.last() {
             server.send(Msg::Start).unwrap();
-            #[cfg(feature = "traceable")]
-            debug!("    - The server WAS spawned!");
+            // #[cfg(feature = "traceable")]
+            // debug!("    - The server WAS spawned!");
         } else {
-            #[cfg(feature = "traceable")]
-            debug!("    - The server was NOT spawned!");
+            // #[cfg(feature = "traceable")]
+            // debug!("    - The server was NOT spawned!");
         };
     }
 }
@@ -291,8 +236,8 @@ impl Client<String> {
         let address = listener.local_addr().unwrap().to_string();
         let mut url: String = "".to_owned();
         url.push_str(&address);
-        #[cfg(feature = "traceable")]
-        debug!("Added address: {}", address);
+        // #[cfg(feature = "traceable")]
+        // debug!("Added address: {}", address);
         self.addresses.push(url.clone());
         url
     }
@@ -331,28 +276,28 @@ enum Msg {
     Stop,
 }
 
-#[cfg_attr(feature = "traceable", tracing::instrument)]
+#[cfg_attr(feature = "traceable", minitrace::trace("spawn-server"))]
 fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         while let Ok(msg) = &rx.recv() {
             match msg {
                 Msg::Start => {
-                    #[cfg(feature = "traceable")]
-                    debug!("    - The server should start.");
+                    // #[cfg(feature = "traceable")]
+                    // debug!("    - The server should start.");
                     init_mio_server(address.clone());
-                    #[cfg(feature = "traceable")]
-                    debug!("      - The server has started.");
+                    // #[cfg(feature = "traceable")]
+                    // debug!("      - The server has started.");
                 }
                 Msg::Stop => {
-                    #[cfg(feature = "traceable")]
-                    debug!("    - The server should stop.");
+                    // #[cfg(feature = "traceable")]
+                    // debug!("    - The server should stop.");
                     return;
                 }
             }
         }
-        #[cfg(feature = "traceable")]
-        debug!("The server has stopped!");
+        // #[cfg(feature = "traceable")]
+        // debug!("The server has stopped!");
     });
     tx
 }
@@ -360,10 +305,10 @@ fn spawn_server(address: std::string::String) -> std::sync::mpsc::Sender<Msg> {
 // We need a server that eliminates Hyper server code as an explanation.
 // This is a lean TCP server for responding with Hello World! to a request.
 // https://github.com/sergey-melnychuk/mio-tcp-server
-#[cfg_attr(feature = "traceable", tracing::instrument)]
+#[cfg_attr(feature = "traceable", minitrace::trace("init-mio-server"))]
 fn init_mio_server(address: std::string::String) {
-    #[cfg(feature = "traceable")]
-    debug!("Server: {}", address);
+    // #[cfg(feature = "traceable")]
+    // debug!("Server: {}", address);
     let mut listener =
         reuse_mio_listener(&address.parse().unwrap()).expect("Could not bind to address");
     let mut poll = mio::Poll::new().unwrap();
@@ -460,7 +405,7 @@ fn init_mio_server(address: std::string::String) {
 }
 
 // Make server startup robust to existing listener on the same address.
-#[cfg_attr(feature = "traceable", tracing::instrument)]
+#[cfg_attr(feature = "traceable", minitrace::trace("reuse_mio_listener"))]
 fn reuse_mio_listener(
     addr: &std::net::SocketAddr,
 ) -> Result<mio::net::TcpListener, std::convert::Infallible> {

@@ -1,13 +1,16 @@
 # Issue: Reproducible Hyper Client Hang
 
+This branch uses minitrace - it has proved less brittle than chaining the
+tracing crates (tracing, opentelemetry, tracing-opentelemetry, opentelemety-jaeger)
+
 This demonstrates a reproducible hang in the Hyper client.
 To see if the default settings reproduce a hang on your system:
 
 | Setting       | MRE | MRE-OK |
 |---------------+-----+--------|
-| `nrequests`   | 1M  | 1M     |
-| `nclients`    | 40  | 10     |
-| `nservers`    | 40  | 10     |
+| `nrequests`   | 750 | 750    |
+| `nclients`    |  40 |  10    |
+| `nservers`    |  40 |  10    |
 | `concurrency` | 128 | 128    |
 
 ## Setup
@@ -39,9 +42,6 @@ podman run \
       --publish 16685:16685 \
       --publish 16686:16686 \
       jaegertracing/all-in-one:1.27.0
-podman run \
-      --publish 9411:9411 \
-      openzipkin/zipkin
 ```
 
 Now build and run the tracing example:
@@ -175,7 +175,7 @@ podman run -p6831:6831/udp -p6832:6832/udp -p16686:16686 -p14268:14268 jaegertra
 In a second console:
 
 ```bash
-OTEL_BSP_MAX_EXPORT_BATCH_SIZE=64 cargo run --example mre --profile release --features=ok,traceable  -- --nocapture &> mre-ok-traceable.log
+OTEL_BSP_MAX_EXPORT_BATCH_SIZE=64 cargo run --bin mre --profile release --features=ok,traceable  -- --nocapture &> mre-ok-traceable.log
 ```
 
 ## Hanging behavior
