@@ -1,7 +1,8 @@
 repo_name: taqtiqa-mark/issue
 report_id: 54e1bd9a9e632e73d8af5d4e2ef6833b
+version: 0.1
 repo_type: Public
-timestamp: '2023-11-09T21:29:00+00:00'
+timestamp: '2024-01-04T15:15:09+00:00'
 requested_by: taqtiqa-mark
 provider: github
 branch: master
@@ -16,6 +17,7 @@ tools:
   category: Languages & Frameworks
   sub_category: Languages
   image_url: https://img.stackshare.io/service/1209/javascript.jpeg
+  detection_source_url: https://github.com/taqtiqa-mark/issue/blob/master/Cargo.toml
   detection_source: Cargo.toml
   last_updated_by: Mark van de Vyver
   last_updated_on: 2021-09-23 06:13:10.000000000 Z
@@ -28,6 +30,7 @@ tools:
   category: Languages & Frameworks
   sub_category: Languages
   image_url: https://img.stackshare.io/service/993/pUBY5pVj.png
+  detection_source_url: https://github.com/taqtiqa-mark/issue/blob/master/Cargo.toml
   detection_source: Cargo.toml
   last_updated_by: Mark van de Vyver
   last_updated_on: 2021-09-23 06:13:10.000000000 Z
@@ -39,6 +42,7 @@ tools:
   category: Languages & Frameworks
   sub_category: Languages
   image_url: https://img.stackshare.io/service/1070/v7txhrjp9pdqrkdtxxp0.png
+  detection_source_url: https://github.com/taqtiqa-mark/issue
   detection_source: Repo Metadata
 - name: Git
   description: Fast, scalable, distributed revision control system
@@ -48,6 +52,7 @@ tools:
   category: Build, Test, Deploy
   sub_category: Version Control System
   image_url: https://img.stackshare.io/service/1046/git.png
+  detection_source_url: https://github.com/taqtiqa-mark/issue
   detection_source: Repo Metadata
 - name: Hyper
   description: On-Demand Container, Per-Second Billing
@@ -57,6 +62,7 @@ tools:
   category: Build, Test, Deploy
   sub_category: Containers as a Service
   image_url: https://img.stackshare.io/service/3125/xSVaubUG_400x400.jpg
+  detection_source_url: https://github.com/taqtiqa-mark/issue/blob/master/Cargo.toml
   detection_source: Cargo.toml
   last_updated_by: Mark van de Vyver
   last_updated_on: 2021-09-26 02:38:11.000000000 Z
@@ -68,6 +74,7 @@ tools:
   category: Build, Test, Deploy
   sub_category: Hosted Package Repository
   image_url: https://img.stackshare.io/service/12572/-RIWgodF_400x400.jpg
+  detection_source_url: https://github.com/taqtiqa-mark/issue/blob/master/Cargo.toml
   detection_source: Cargo.toml
   last_updated_by: Mark van de Vyver
   last_updated_on: 2021-09-23 06:13:10.000000000 Z
@@ -79,6 +86,7 @@ tools:
   category: Build, Test, Deploy
   sub_category: Front End Package Manager
   image_url: https://img.stackshare.io/service/1120/lejvzrnlpb308aftn31u.png
+  detection_source_url: https://github.com/taqtiqa-mark/issue/blob/master/Cargo.toml
   detection_source: Cargo.toml
   last_updated_by: Mark van de Vyver
   last_updated_on: 2021-09-23 06:13:10.000000000 Z
